@@ -186,9 +186,9 @@ def solve_timetable(data, max_seconds=20):
     #  (Qat'iy man etilsa, ko'p o'qituvchili maktabda darslar joyga sig'may qolardi.)
     # =====================================================================
     W_PLACED = 1000
-    W_CGAP = 50     # sinf oynasi — joylashtirilgandan keyingi eng muhim maqsad
-    W_IMBAL = 20
-    W_TGAP = 4
+    W_CGAP = 120    # sinf oynasi — kuchli jarima (darslar zich bo'lsin)
+    W_IMBAL = 15
+    W_TGAP = 3
     W_EARLY = 1
 
     obj = []
@@ -293,20 +293,31 @@ def solve_timetable(data, max_seconds=20):
     solver = cp_model.CpSolver()
     solver.parameters.num_search_workers = 8
 
-    # 1-bosqich: max joylashtirish (odatda tez)
+    # 1-bosqich: TEZ maksimal joylashtirishni top (faqat placement, sifatsiz)
     m.Maximize(placed_sum)
-    solver.parameters.max_time_in_seconds = float(max_seconds) * 0.3
+    solver.parameters.max_time_in_seconds = max(4.0, float(max_seconds) * 0.25)
     st1 = solver.Solve(m)
     best_placed = None
+    hint_vars, hint_vals = [], []
     if st1 in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         best_placed = int(solver.ObjectiveValue())
+        # 1-bosqich yechimini 2-bosqichga "maslahat" (hint) sifatida beramiz -> tezlashadi
+        for key, var in x.items():
+            hint_vars.append(var)
+            hint_vals.append(int(solver.Value(var)))
 
-    # 2-bosqich: joylashtirishni saqlab, sifatni (gap, muvozanat) optimallashtir
+    # 2-bosqich: joylashtirishni saqlab, SIFATNI (oyna, muvozanat) optimallashtir.
     status = st1
     if best_placed is not None:
+        # deyarli hamma dars joylashsin (1-2 dars kamayishiga ruxsat -> oyna kamayadi)
         m.Add(placed_sum >= best_placed)
+        # umumiy maqsad: placement (juda katta vazn) + sifat
         m.Maximize(sum(obj))
-        solver.parameters.max_time_in_seconds = float(max_seconds) * 0.7
+        if hint_vars:
+            m.ClearHints()
+            for v, val in zip(hint_vars, hint_vals):
+                m.AddHint(v, val)
+        solver.parameters.max_time_in_seconds = max(6.0, float(max_seconds) * 0.75)
         st2 = solver.Solve(m)
         if st2 in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             status = st2
