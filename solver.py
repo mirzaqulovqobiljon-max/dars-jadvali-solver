@@ -100,7 +100,7 @@ def solve_timetable(data, max_seconds=20):
         m.Add(p <= hours)
         placed[ai] = (p, hours)
 
-    # Sinf bir vaqtda bitta dars + prefix (bo'sh oyna yo'q)
+    # Sinf bir vaqtda bitta dars (bo'sh oyna endi QAT'IY emas — objective'da yumshoq)
     # y[c,d,s] = shu sinf shu (d,s) da band
     y = {}
     class_ids = [c["id"] for c in classes]
@@ -116,9 +116,6 @@ def solve_timetable(data, max_seconds=20):
                     m.Add(sum(occ) <= 1)
                 else:
                     m.Add(yv == 0)
-            # PREFIX: agar (d,s+1) band bo'lsa (d,s) ham band -> oynasiz, 0-dan ketma-ket
-            for s in range(slots - 1):
-                m.Add(y[(c, d, s)] >= y[(c, d, s + 1)])
 
     # O'qituvchi bir vaqtda bitta dars (parallel yo'q) — split teacher ham
     teacher_slot = {}  # (tid,d,s) -> list of vars
@@ -179,16 +176,19 @@ def solve_timetable(data, max_seconds=20):
     # =====================================================================
     #  MAQSAD FUNKSIYASI (objective)
     #  Ustuvorlik (leksikografik vaznlar bilan):
-    #    W_PLACED   — imkon qadar ko'p dars joylashtirish (eng muhim)
+    #    W_PLACED   — imkon qadar ko'p dars joylashtirish (ENG MUHIM)
+    #    W_CGAP     — sinf jadvalidagi bo'sh oynalarni minimallashtirish (kun o'rtasida)
     #    W_IMBAL    — kunlar orasidagi nomutanosiblikni minimallashtirish
-    #    W_TGAP     — o'qituvchi jadvalidagi gaplarni (bo'sh oynalarni) minimallashtirish
+    #    W_TGAP     — o'qituvchi jadvalidagi gaplarni minimallashtirish
     #    W_EARLY    — og'ir fanlarni ertaroq soatlarga (eng kichik ta'sir)
-    #  Eslatma: sinf ichidagi gaplar (kun o'rtasidagi bo'sh joy) prefix sharti
-    #  bilan ALLAQACHON QAT'IY 0 ga tenglashtirilgan (yuqoriga qarang).
+    #  MUHIM: bo'sh oyna endi QAT'IY man etilmagan — u YUMSHOQ maqsad. Shunda
+    #  avval HAMMA dars joylashadi, keyin oynalar iloji boricha kamaytiriladi.
+    #  (Qat'iy man etilsa, ko'p o'qituvchili maktabda darslar joyga sig'may qolardi.)
     # =====================================================================
     W_PLACED = 1000
-    W_IMBAL = 30
-    W_TGAP = 5
+    W_CGAP = 50     # sinf oynasi — joylashtirilgandan keyingi eng muhim maqsad
+    W_IMBAL = 20
+    W_TGAP = 4
     W_EARLY = 1
 
     obj = []
@@ -197,6 +197,24 @@ def solve_timetable(data, max_seconds=20):
     for ai in range(len(assignments)):
         p, hours = placed[ai]
         obj.append(W_PLACED * p)
+
+    # 1b) SINF BO'SH OYNALARI (minimal): kun o'rtasidagi bo'sh slot.
+    #     gap = (band emas) VA (o'sha kuni keyin dars bor). Faqat kun oxiridagi
+    #     bo'sh joylar jarimasiz qoladi — aynan kerakli xatti-harakat.
+    for c in class_ids:
+        for d in D:
+            for s in range(slots):
+                after = m.NewBoolVar(f"cafter_{c}_{d}_{s}")
+                laters = [y[(c, d, s2)] for s2 in range(s + 1, slots)]
+                if laters:
+                    m.AddMaxEquality(after, laters)
+                else:
+                    m.Add(after == 0)
+                cgap = m.NewBoolVar(f"cgap_{c}_{d}_{s}")
+                m.Add(cgap <= after)
+                m.Add(cgap <= 1 - y[(c, d, s)])
+                m.Add(cgap >= after - y[(c, d, s)])
+                obj.append(-W_CGAP * cgap)
 
     # 2) KUNLAR NOMUTANOSIBLIGI (minimal): har sinf uchun (eng band kun - eng bo'sh kun)
     #    Chegara YUMSHOQ (objective orqali) — shunda avval maksimal dars joylashadi,
@@ -275,21 +293,20 @@ def solve_timetable(data, max_seconds=20):
     solver = cp_model.CpSolver()
     solver.parameters.num_search_workers = 8
 
-    # 1-bosqich: max joylashtirish
+    # 1-bosqich: max joylashtirish (odatda tez)
     m.Maximize(placed_sum)
-    solver.parameters.max_time_in_seconds = float(max_seconds) * 0.5
+    solver.parameters.max_time_in_seconds = float(max_seconds) * 0.3
     st1 = solver.Solve(m)
     best_placed = None
     if st1 in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         best_placed = int(solver.ObjectiveValue())
 
-    # 2-bosqich: joylashtirishni (deyarli) saqlab, sifatni optimallashtir
+    # 2-bosqich: joylashtirishni saqlab, sifatni (gap, muvozanat) optimallashtir
     status = st1
     if best_placed is not None:
-        # joylashgan darslar soni kamida (best_placed) bo'lsin
         m.Add(placed_sum >= best_placed)
         m.Maximize(sum(obj))
-        solver.parameters.max_time_in_seconds = float(max_seconds) * 0.5
+        solver.parameters.max_time_in_seconds = float(max_seconds) * 0.7
         st2 = solver.Solve(m)
         if st2 in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             status = st2
