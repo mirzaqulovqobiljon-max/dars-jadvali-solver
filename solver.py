@@ -199,18 +199,18 @@ def solve_timetable(data, max_seconds=20):
         obj.append(W_PLACED * p)
 
     # 2) KUNLAR NOMUTANOSIBLIGI (minimal): har sinf uchun (eng band kun - eng bo'sh kun)
+    #    Chegara YUMSHOQ (objective orqali) — shunda avval maksimal dars joylashadi,
+    #    keyin imkon qadar tekis taqsimlanadi. Qat'iy chegara qo'ymaymiz, aks holda
+    #    kam o'qituvchi holatida ko'p dars "joylashmadi"ga chiqib ketardi.
     for c in class_ids:
         total = sum(int(a.get("hoursPerWeek") or 0)
                     for a in assignments if a["classId"] == c)
         if total <= 0:
             continue
-        hi = (total + days - 1) // days
-        hi = min(slots, hi + 1)
         loads = []
         for d in D:
             load = m.NewIntVar(0, slots, f"load_{c}_{d}")
             m.Add(load == sum(y[(c, d, s)] for s in S))
-            m.Add(load <= hi)                 # QAT'IY: bir kunga to'planmasin
             loads.append(load)
         mxl = m.NewIntVar(0, slots, f"mxl_{c}")
         mnl = m.NewIntVar(0, slots, f"mnl_{c}")
@@ -220,41 +220,43 @@ def solve_timetable(data, max_seconds=20):
 
     # 3) O'QITUVCHI GAPLARI (minimal): o'qituvchining bir kunidagi darslar orasidagi
     #    bo'sh soatlar. Gap = (oxirgi dars slot - birinchi dars slot + 1) - darslar soni.
-    #    (Kam o'zgaruvchi bilan — tez ishlaydi.)
-    teacher_ids = [t["id"] for t in data["teachers"]]
-    occ = {}
-    for tid in teacher_ids:
-        for d in D:
-            for s in S:
-                lst = teacher_slot.get((tid, d, s), [])
-                ov = m.NewBoolVar(f"occ_{tid}_{d}_{s}")
-                if lst:
-                    m.Add(ov == sum(lst))
-                else:
-                    m.Add(ov == 0)
-                occ[(tid, d, s)] = ov
-    for tid in teacher_ids:
-        for d in D:
-            day_occ = [occ[(tid, d, s)] for s in S]
-            cnt = m.NewIntVar(0, slots, f"cnt_{tid}_{d}")
-            m.Add(cnt == sum(day_occ))
-            has_any = m.NewBoolVar(f"has_{tid}_{d}")
-            m.Add(cnt >= 1).OnlyEnforceIf(has_any)
-            m.Add(cnt == 0).OnlyEnforceIf(has_any.Not())
-            # birinchi va oxirgi band slot (faqat dars bor bo'lsa ma'noli)
-            first = m.NewIntVar(0, slots - 1, f"first_{tid}_{d}")
-            last = m.NewIntVar(0, slots - 1, f"last_{tid}_{d}")
-            for s in S:
-                # agar s band bo'lsa: first<=s, last>=s
-                m.Add(first <= s).OnlyEnforceIf(occ[(tid, d, s)])
-                m.Add(last >= s).OnlyEnforceIf(occ[(tid, d, s)])
-            span = m.NewIntVar(0, slots, f"span_{tid}_{d}")
-            # span = last - first + 1 (dars bor bo'lsa), aks holda 0
-            m.Add(span == last - first + 1).OnlyEnforceIf(has_any)
-            m.Add(span == 0).OnlyEnforceIf(has_any.Not())
-            gaps_td = m.NewIntVar(0, slots, f"gaps_{tid}_{d}")
-            m.Add(gaps_td == span - cnt)
-            obj.append(-W_TGAP * gaps_td)
+    #    DIQQAT: bu qism ko'p o'zgaruvchi qo'shadi. Katta masalada (ko'p sinf/o'qituvchi)
+    #    uni o'chiramiz — shunda solver maksimal dars joylashtirishga e'tibor beradi
+    #    va tez ishlaydi. Kichik masalada esa o'qituvchi jadvalini ixchamlaymiz.
+    total_hours = sum(int(a.get("hoursPerWeek") or 0) for a in assignments)
+    enable_tgap = (total_hours <= 120)   # ~15 sinfgacha to'liq optimallashtiramiz
+    if enable_tgap:
+        teacher_ids = [t["id"] for t in data["teachers"]]
+        occ = {}
+        for tid in teacher_ids:
+            for d in D:
+                for s in S:
+                    lst = teacher_slot.get((tid, d, s), [])
+                    ov = m.NewBoolVar(f"occ_{tid}_{d}_{s}")
+                    if lst:
+                        m.Add(ov == sum(lst))
+                    else:
+                        m.Add(ov == 0)
+                    occ[(tid, d, s)] = ov
+        for tid in teacher_ids:
+            for d in D:
+                day_occ = [occ[(tid, d, s)] for s in S]
+                cnt = m.NewIntVar(0, slots, f"cnt_{tid}_{d}")
+                m.Add(cnt == sum(day_occ))
+                has_any = m.NewBoolVar(f"has_{tid}_{d}")
+                m.Add(cnt >= 1).OnlyEnforceIf(has_any)
+                m.Add(cnt == 0).OnlyEnforceIf(has_any.Not())
+                first = m.NewIntVar(0, slots - 1, f"first_{tid}_{d}")
+                last = m.NewIntVar(0, slots - 1, f"last_{tid}_{d}")
+                for s in S:
+                    m.Add(first <= s).OnlyEnforceIf(occ[(tid, d, s)])
+                    m.Add(last >= s).OnlyEnforceIf(occ[(tid, d, s)])
+                span = m.NewIntVar(0, slots, f"span_{tid}_{d}")
+                m.Add(span == last - first + 1).OnlyEnforceIf(has_any)
+                m.Add(span == 0).OnlyEnforceIf(has_any.Not())
+                gaps_td = m.NewIntVar(0, slots, f"gaps_{tid}_{d}")
+                m.Add(gaps_td == span - cnt)
+                obj.append(-W_TGAP * gaps_td)
 
     # 4) og'ir fanlar ertaroq soatlarga (eng kichik ta'sir)
     for ai, a in enumerate(assignments):
@@ -265,12 +267,32 @@ def solve_timetable(data, max_seconds=20):
                     if (ai, d, s) in x:
                         obj.append(W_EARLY * (slots - s) * x[(ai, d, s)])
 
-    m.Maximize(sum(obj))
+    # ===== IKKI BOSQICHLI YECHIM (lexicographic) =====
+    # 1-bosqich: FAQAT maksimal dars joylashtirishni top (tez).
+    # 2-bosqich: o'sha maksimalni saqlagan holda sifatni (gap, muvozanat) yaxshila.
+    placed_sum = sum(placed[ai][0] for ai in range(len(assignments)))
 
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = float(max_seconds)
     solver.parameters.num_search_workers = 8
-    status = solver.Solve(m)
+
+    # 1-bosqich: max joylashtirish
+    m.Maximize(placed_sum)
+    solver.parameters.max_time_in_seconds = float(max_seconds) * 0.5
+    st1 = solver.Solve(m)
+    best_placed = None
+    if st1 in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        best_placed = int(solver.ObjectiveValue())
+
+    # 2-bosqich: joylashtirishni (deyarli) saqlab, sifatni optimallashtir
+    status = st1
+    if best_placed is not None:
+        # joylashgan darslar soni kamida (best_placed) bo'lsin
+        m.Add(placed_sum >= best_placed)
+        m.Maximize(sum(obj))
+        solver.parameters.max_time_in_seconds = float(max_seconds) * 0.5
+        st2 = solver.Solve(m)
+        if st2 in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            status = st2
 
     status_name = {
         cp_model.OPTIMAL: "OPTIMAL",
