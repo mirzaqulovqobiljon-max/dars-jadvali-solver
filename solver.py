@@ -261,7 +261,7 @@ def solve_timetable(data, max_seconds=20):
         m.Add(p <= hours)
         placed[ai] = (p, hours)
 
-    # Sinf bir vaqtda bitta dars (bo'sh oyna endi QAT'IY emas — objective'da yumshoq)
+    # Sinf bir vaqtda bitta dars
     # y[c,d,s] = shu sinf shu (d,s) da band
     y = {}
     class_ids = [c["id"] for c in classes]
@@ -277,6 +277,37 @@ def solve_timetable(data, max_seconds=20):
                     m.Add(sum(occ) <= 1)
                 else:
                     m.Add(yv == 0)
+
+    # ===== QAT'IY: ORALIQDA BO'SH OYNA YO'Q (prefix) =====
+    # Agar (d, s+1) band bo'lsa, (d, s) ham band bo'lishi shart -> darslar 1-soatdan
+    # ketma-ket, bo'sh joy faqat kun oxirida.
+    for c in class_ids:
+        for d in D:
+            for s in range(slots - 1):
+                m.Add(y[(c, d, s)] >= y[(c, d, s + 1)])
+
+    # ===== QAT'IY: har kun 0 YOKI kamida MIN_PER_DAY soat =====
+    # Kun bo'sh bo'lsa mayli, lekin dars bo'lsa — kamida 4 ta (chala kun bo'lmasin).
+    # DIQQAT: bu shart faqat YETARLI darsli sinflarga qo'llaniladi. Agar sinfning
+    # jami soati kam bo'lsa (masalan boshlang'ich sinf, 5-10 soat), "kunda >=4" sharti
+    # imkonsiz bo'lardi — shuning uchun bunday sinflarга yumshoqroq chegara qo'yamiz.
+    MIN_PER_DAY = 4
+    for c in class_ids:
+        total_c = sum(int(a.get("hoursPerWeek") or 0)
+                      for a in assignments if a["classId"] == c)
+        # bu sinf uchun realistik min: jami soat nechta to'liq kunga bo'linadi
+        # (masalan 5 soatli sinfga "kunda >=4" -> min=4 emas, min=2 xavfsizroq)
+        min_day = MIN_PER_DAY
+        if total_c < MIN_PER_DAY * 2:      # juda kam darsli sinf
+            min_day = max(1, total_c)      # hammasi bitta kunga (yoki nechta bo'lsa)
+        elif total_c < MIN_PER_DAY * days:
+            min_day = min(MIN_PER_DAY, max(2, total_c // days + 1))
+        for d in D:
+            day_load = sum(y[(c, d, s)] for s in S)
+            has_day = m.NewBoolVar(f"hasday_{c}_{d}")
+            m.Add(day_load >= 1).OnlyEnforceIf(has_day)
+            m.Add(day_load == 0).OnlyEnforceIf(has_day.Not())
+            m.Add(day_load >= min_day).OnlyEnforceIf(has_day)
 
     # O'qituvchi bir vaqtda bitta dars (parallel yo'q) — split teacher ham
     teacher_slot = {}  # (tid,d,s) -> list of vars
@@ -308,6 +339,13 @@ def solve_timetable(data, max_seconds=20):
             m.Add(sum(lst) <= 1)
 
     # Bir kunda bir xil fan ko'pi bilan 1 marta (per class+subject+day)
+    # ISTISNO: agar fanning haftalik soati kunlar sonidan ko'p bo'lsa (masalan Ingliz
+    # 8 soat, 6 kun), "kunda 1 marta" bilan sig'maydi -> bunday fanga kunda 2 marta
+    # (juft dars) ruxsat beramiz. Bu maktabda odatiy holat.
+    subj_week_hours = {}
+    for a in assignments:
+        key = (a["classId"], a["subjectId"])
+        subj_week_hours[key] = subj_week_hours.get(key, 0) + int(a.get("hoursPerWeek") or 0)
     csd = {}
     for ai, a in enumerate(assignments):
         for d in D:
@@ -316,8 +354,11 @@ def solve_timetable(data, max_seconds=20):
                 if (ai, d, s) in x:
                     csd.setdefault(key, []).append(x[(ai, d, s)])
     for key, lst in csd.items():
-        if len(lst) > 1:
-            m.Add(sum(lst) <= 1)
+        cid, subid, d = key
+        wh = subj_week_hours.get((cid, subid), 0)
+        max_per_day = 2 if wh > days else 1
+        if len(lst) > max_per_day:
+            m.Add(sum(lst) <= max_per_day)
 
     # O'qituvchi haftalik maksimal soati
     teacher_all = {}
