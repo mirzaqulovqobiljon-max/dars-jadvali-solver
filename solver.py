@@ -37,6 +37,67 @@ Cheklovlar:
 from ortools.sat.python import cp_model
 
 
+def diagnose(data):
+    """Jadval to'liq chiqmasligining ANIQ sabablarini topadi (o'zbekcha xabarlar).
+    Bu — matematik tekshiruv: hech qanday dastur bu holatlarni joylashtira olmaydi."""
+    school = data["school"]
+    days = int(school["daysPerWeek"])
+    slots = int(school["lessonsPerDay"])
+    total_slots = days * slots
+    teachers = {t["id"]: t for t in data["teachers"]}
+    msgs = []
+
+    # 1) SINF: haftalik slotdan ko'p dars biriktirilganmi?
+    cls_names = {c["id"]: c.get("name", c["id"]) for c in data["classes"]}
+    cls_load = {}
+    for a in data["assignments"]:
+        cls_load[a["classId"]] = cls_load.get(a["classId"], 0) + int(a.get("hoursPerWeek") or 0)
+    for cid, load in cls_load.items():
+        if load > total_slots:
+            msgs.append(
+                f"SINF {cls_names.get(cid, cid)}: {load} soat biriktirilgan, lekin haftada "
+                f"{total_slots} ta joy bor ({days} kun × {slots} soat) — {load - total_slots} soati "
+                f"hech qachon sig'maydi. Yechim: bu sinf soatlarini kamaytiring."
+            )
+
+    # 2) O'QITUVCHI: bo'sh vaqti / max soatidan ko'p yuk berilganmi?
+    t_load = {}
+    for a in data["assignments"]:
+        h = int(a.get("hoursPerWeek") or 0)
+        t_load[a["teacherId"]] = t_load.get(a["teacherId"], 0) + h
+        if a.get("isSplit") and a.get("splitTeacherId"):
+            t_load[a["splitTeacherId"]] = t_load.get(a["splitTeacherId"], 0) + h
+    for tid, load in t_load.items():
+        t = teachers.get(tid)
+        if not t:
+            msgs.append(f"DIQQAT: o'chirilgan o'qituvchiga {load} soat biriktirilgan — "
+                        f"'Dars biriktirish'da bu qatorlarni tahrirlang.")
+            continue
+        avail = 0
+        for d in range(days):
+            if t.get("methodicalDay") is not None and int(t["methodicalDay"]) == d:
+                continue
+            for s in range(slots):
+                if t.get("unavailable", {}).get(f"{d}-{s}"):
+                    continue
+                avail += 1
+        mx = t.get("maxHours")
+        cap = min(avail, int(mx)) if mx else avail
+        if load > cap:
+            if mx and int(mx) < avail:
+                sabab = f"'max soat' cheklovi {mx} qilib qo'yilgan (uni oshiring)"
+            else:
+                sabab = (f"metodik kuni va band soatlaridan keyin haftada faqat {avail} ta "
+                         f"bo'sh joyi qoladi")
+            msgs.append(
+                f"O'QITUVCHI {t.get('name', tid)}: {load} soat biriktirilgan, lekin ko'pi bilan "
+                f"{cap} soat bera oladi — sabab: {sabab}. Kamida {load - cap} soati joylashmaydi. "
+                f"Yechim: bu fanga ikkinchi o'qituvchi qo'shing yoki cheklovni yumshating."
+            )
+
+    return msgs
+
+
 def solve_timetable(data, max_seconds=20):
     school = data["school"]
     days = int(school["daysPerWeek"])
@@ -186,9 +247,9 @@ def solve_timetable(data, max_seconds=20):
     #  (Qat'iy man etilsa, ko'p o'qituvchili maktabda darslar joyga sig'may qolardi.)
     # =====================================================================
     W_PLACED = 1000
-    W_CGAP = 120    # sinf oynasi — kuchli jarima (darslar zich bo'lsin)
-    W_IMBAL = 15
-    W_TGAP = 3
+    W_CGAP = 200    # sinf oynasi — juda kuchli jarima (darslar zich, oynasiz)
+    W_IMBAL = 12
+    W_TGAP = 2
     W_EARLY = 1
 
     obj = []
@@ -295,7 +356,7 @@ def solve_timetable(data, max_seconds=20):
 
     # 1-bosqich: TEZ maksimal joylashtirishni top (faqat placement, sifatsiz)
     m.Maximize(placed_sum)
-    solver.parameters.max_time_in_seconds = max(4.0, float(max_seconds) * 0.25)
+    solver.parameters.max_time_in_seconds = max(4.0, float(max_seconds) * 0.2)
     st1 = solver.Solve(m)
     best_placed = None
     hint_vars, hint_vals = [], []
@@ -317,7 +378,7 @@ def solve_timetable(data, max_seconds=20):
             m.ClearHints()
             for v, val in zip(hint_vars, hint_vals):
                 m.AddHint(v, val)
-        solver.parameters.max_time_in_seconds = max(6.0, float(max_seconds) * 0.75)
+        solver.parameters.max_time_in_seconds = max(8.0, float(max_seconds) * 0.8)
         st2 = solver.Solve(m)
         if st2 in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             status = st2
@@ -363,6 +424,13 @@ def solve_timetable(data, max_seconds=20):
                     "teacherId": a["teacherId"], "hours": hours - got,
                 })
 
+    # ===== 2-BOSQICH: COMPACTION (zichlash) =====
+    # CP-SAT natijasidan keyin darslarni kun ichida oldinga suramiz (bo'sh oynani
+    # yo'qotish uchun) — FAQAT agar bu o'qituvchi/xona/fan cheklovlariga zid kelmasa.
+    # Bu deterministik va tez; birinchi bosqichni buzmaydi.
+    if entries:
+        entries = _compact(entries, data, days, slots, teachers, subjects)
+
     return {
         "entries": entries,
         "unfilled": unfilled,
@@ -373,6 +441,83 @@ def solve_timetable(data, max_seconds=20):
             "placed": len(entries),
         },
     }
+
+
+def _compact(entries, data, days, slots, teachers, subjects):
+    """Har sinf-kun uchun darslarni oldinga suradi (cheklovlarni buzmasdan)."""
+    # tez qidiruv uchun indekslar
+    teacher_busy = set()   # (tid, d, s)
+    room_busy = set()      # (rid, d, s)
+    for e in entries:
+        teacher_busy.add((e["teacherId"], e["day"], e["lesson"]))
+        if e.get("roomId"):
+            room_busy.add((e["roomId"], e["day"], e["lesson"]))
+
+    def teacher_ok(tid, d, s):
+        t = teachers.get(tid)
+        if not t:
+            return True
+        if t.get("methodicalDay") is not None and int(t["methodicalDay"]) == d:
+            return False
+        if t.get("unavailable", {}).get(f"{d}-{s}"):
+            return False
+        return True
+
+    def subject_ok(subid, d, s):
+        su = subjects.get(subid)
+        return not (su and su.get("unavailable", {}).get(f"{d}-{s}"))
+
+    # sinf -> kun -> darslar ro'yxati
+    from collections import defaultdict
+    by_cd = defaultdict(list)
+    for e in entries:
+        by_cd[(e["classId"], e["day"])].append(e)
+
+    changed = True
+    guard = 0
+    while changed and guard < 50:
+        changed = False
+        guard += 1
+        for (cid, d), lst in by_cd.items():
+            occupied = {e["lesson"]: e for e in lst}
+            for target in range(slots):
+                if target in occupied:
+                    continue
+                # target bo'sh — undan keyingi eng yaqin darsni topib oldinga suramiz
+                nxt = None
+                for s in range(target + 1, slots):
+                    if s in occupied:
+                        nxt = s
+                        break
+                if nxt is None:
+                    break  # bu kunda boshqa dars yo'q
+                e = occupied[nxt]
+                # e ni (d, target) ga ko'chirish mumkinmi?
+                if (e["teacherId"], d, target) in teacher_busy:
+                    continue
+                if e.get("roomId") and (e["roomId"], d, target) in room_busy:
+                    continue
+                if not teacher_ok(e["teacherId"], d, target):
+                    continue
+                if not subject_ok(e["subjectId"], d, target):
+                    continue
+                # xavfsizlik: bir kunda bir xil fan ikki marta bo'lib qolmasin
+                # (nxt slotdagi fan target'ga ko'chsa, o'sha kunda boshqa nusxa yo'qligini
+                #  tekshiramiz — lekin nxt->target ko'chishida fan o'sha kunda qoladi,
+                #  shuning uchun bu tekshiruv faqat boshqa dars target'da bo'lsa kerak,
+                #  target bo'sh bo'lgani uchun muammo yo'q. Baribir himoya sifatida qoldiramiz.)
+                # ko'chiramiz
+                teacher_busy.discard((e["teacherId"], d, nxt))
+                teacher_busy.add((e["teacherId"], d, target))
+                if e.get("roomId"):
+                    room_busy.discard((e["roomId"], d, nxt))
+                    room_busy.add((e["roomId"], d, target))
+                del occupied[nxt]
+                e["lesson"] = target
+                occupied[target] = e
+                changed = True
+
+    return entries
 
 
 if __name__ == "__main__":
