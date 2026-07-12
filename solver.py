@@ -461,7 +461,7 @@ def solve_timetable(data, max_seconds=20):
         m.AddHint(var, 1 if key in seed else 0)
 
     solver = cp_model.CpSolver()
-    solver.parameters.num_search_workers = 8
+    solver.parameters.num_search_workers = 4
     solver.parameters.max_time_in_seconds = float(max_seconds)
     status = solver.Solve(m)
 
