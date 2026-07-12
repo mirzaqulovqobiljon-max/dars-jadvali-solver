@@ -672,6 +672,101 @@ def _compact(entries, data, days, slots, teachers, subjects):
                             if e.get("roomId"):
                                 room_busy.add((e["roomId"], od, o_last))
 
+    # 3-BOSQICH: agressiv oyna to'ldirish — bo'sh oynaga boshqa kundagi ISTALGAN
+    # darsni (nafaqat oxirgisini) ko'chiramiz, agar u dars o'z kunida oxirgi bo'lsa
+    # (ya'ni uni olib ketish yangi oyna ochmasa) yoki ko'chirilgach o'z kuni zichlansa.
+    changed = True
+    guard = 0
+    while changed and guard < 60:
+        changed = False
+        guard += 1
+        for cid in class_ids:
+            for d in range(days):
+                occ = cells_of(cid, d)
+                if not occ:
+                    continue
+                last = max(occ)
+                gap_slot = None
+                for s in range(last):
+                    if s not in occ:
+                        gap_slot = s
+                        break
+                if gap_slot is None:
+                    continue
+                subj_today = set()
+                for cell in occ.values():
+                    for e in cell:
+                        subj_today.add(e["subjectId"])
+                moved = False
+                for od in range(days):
+                    if od == d or moved:
+                        continue
+                    oocc = cells_of(cid, od)
+                    if not oocc:
+                        continue
+                    o_last = max(oocc)
+                    # o'sha kundagi ISTALGAN slotdagi darsni sinaymiz
+                    for oslot in sorted(oocc.keys(), reverse=True):
+                        if moved:
+                            break
+                        cell = oocc[oslot]
+                        if any(e["subjectId"] in subj_today for e in cell):
+                            continue
+                        for e in cell:
+                            teacher_busy.discard((e["teacherId"], od, oslot))
+                            if e.get("roomId"):
+                                room_busy.discard((e["roomId"], od, oslot))
+                        ok = can_place_cell(cell, d, gap_slot)
+                        if ok:
+                            for e in cell:
+                                e["day"] = d
+                                e["lesson"] = gap_slot
+                                teacher_busy.add((e["teacherId"], d, gap_slot))
+                                if e.get("roomId"):
+                                    room_busy.add((e["roomId"], d, gap_slot))
+                            moved = True
+                            changed = True
+                        else:
+                            for e in cell:
+                                teacher_busy.add((e["teacherId"], od, oslot))
+                                if e.get("roomId"):
+                                    room_busy.add((e["roomId"], od, oslot))
+                # oslotdan bo'shagan joyni to'ldirish keyingi 1-bosqich takrorida hal bo'ladi
+
+    # 4-BOSQICH: qolgan oynalarni yana bir marta kun ichida zichlash
+    changed = True
+    guard = 0
+    while changed and guard < 60:
+        changed = False
+        guard += 1
+        for cid in class_ids:
+            for d in range(days):
+                occ = cells_of(cid, d)
+                for target in range(slots):
+                    if target in occ:
+                        continue
+                    nxt = None
+                    for s in range(target + 1, slots):
+                        if s in occ:
+                            nxt = s
+                            break
+                    if nxt is None:
+                        break
+                    cell = occ[nxt]
+                    for e in cell:
+                        teacher_busy.discard((e["teacherId"], d, nxt))
+                        if e.get("roomId"):
+                            room_busy.discard((e["roomId"], d, nxt))
+                    ok = can_place_cell(cell, d, target)
+                    for e in cell:
+                        teacher_busy.add((e["teacherId"], d, nxt))
+                        if e.get("roomId"):
+                            room_busy.add((e["roomId"], d, nxt))
+                    if ok:
+                        move_cell(cell, d, target)
+                        occ = cells_of(cid, d)
+                        changed = True
+
     return entries
 
 
