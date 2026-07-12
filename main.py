@@ -52,7 +52,7 @@ def generate(req: GenerateRequest):
         "assignments": req.assignments,
     }
     try:
-        result = solve_timetable(data, max_seconds=max(3, min(60, int(req.maxSeconds))))
+        result = solve_timetable(data, max_seconds=max(3, min(90, int(req.maxSeconds))))
         return result
     except Exception as e:
         # Xizmat hech qachon qulamasin — xatoni tushunarli qaytaramiz
