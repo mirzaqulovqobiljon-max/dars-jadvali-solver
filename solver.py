@@ -98,6 +98,106 @@ def diagnose(data):
     return msgs
 
 
+def _greedy_seed(data, days, slots, teachers, subjects, assignments):
+    """Tez greedy jadval: barcha qattiq shartlarga rioya qiladi, zich va muvozanatli.
+    Natija: set of (ai, d, s) — CP-SAT uchun boshlang'ich yechim (hint)."""
+    t_busy = set()      # (tid, d, s)
+    r_busy = set()      # (rid, d, s)
+    c_busy = set()      # (cid, d, s)
+    csd = set()         # (cid, subid, d) — bir kunda bir fan
+    t_hours = {}        # tid -> jami soat
+    c_dayload = {}      # (cid, d) -> soat soni
+
+    def teacher_ok(tid, d, s):
+        t = teachers.get(tid)
+        if not t:
+            return False
+        if t.get("methodicalDay") is not None and int(t["methodicalDay"]) == d:
+            return False
+        if t.get("unavailable", {}).get(f"{d}-{s}"):
+            return False
+        return True
+
+    def subject_ok(subid, d, s):
+        su = subjects.get(subid)
+        return not (su and su.get("unavailable", {}).get(f"{d}-{s}"))
+
+    def teacher_cap_ok(tid, extra=1):
+        t = teachers.get(tid, {})
+        mx = t.get("maxHours")
+        if not mx:
+            return True
+        return t_hours.get(tid, 0) + extra <= int(mx)
+
+    # Har biriktirishni soatlarga yoyamiz; eng cheklangan (qiyin) o'qituvchilar avval
+    tasks = []
+    for ai, a in enumerate(assignments):
+        for _ in range(int(a.get("hoursPerWeek") or 0)):
+            tasks.append((ai, a))
+
+    def constraint_score(item):
+        ai, a = item
+        t = teachers.get(a["teacherId"], {})
+        load = sum(int(b.get("hoursPerWeek") or 0) for b in assignments
+                   if b["teacherId"] == a["teacherId"])
+        meth = 1 if t.get("methodicalDay") is not None else 0
+        unav = len([1 for v in (t.get("unavailable") or {}).values() if v])
+        return -(load * 2 + meth * slots + unav)  # og'ir yuklangan avval
+
+    tasks.sort(key=constraint_score)
+
+    seed = set()
+    for ai, a in enumerate_tasks(tasks):
+        cid, subid, tid = a["classId"], a["subjectId"], a["teacherId"]
+        stid = a.get("splitTeacherId") if a.get("isSplit") else None
+        best = None
+        best_score = None
+        for d in range(days):
+            if (cid, subid, d) in csd:
+                continue
+            for s in range(slots):
+                if (cid, d, s) in c_busy:
+                    continue
+                if (tid, d, s) in t_busy or not teacher_ok(tid, d, s):
+                    continue
+                if stid and ((stid, d, s) in t_busy or not teacher_ok(stid, d, s)):
+                    continue
+                if not subject_ok(subid, d, s):
+                    continue
+                if a.get("roomId") and (a["roomId"], d, s) in r_busy:
+                    continue
+                # ball: zichlik (slot == shu kundagi darslar soni -> oynasiz) + muvozanat
+                dl = c_dayload.get((cid, d), 0)
+                sc = -abs(s - dl) * 10 - dl * 3 - s
+                if best_score is None or sc > best_score:
+                    best_score = sc
+                    best = (d, s)
+        if best is None:
+            continue
+        if not teacher_cap_ok(tid) or (stid and not teacher_cap_ok(stid)):
+            continue
+        d, s = best
+        seed.add((ai, d, s))
+        c_busy.add((cid, d, s))
+        t_busy.add((tid, d, s))
+        if stid:
+            t_busy.add((stid, d, s))
+        if a.get("roomId"):
+            r_busy.add((a["roomId"], d, s))
+        csd.add((cid, subid, d))
+        t_hours[tid] = t_hours.get(tid, 0) + 1
+        if stid:
+            t_hours[stid] = t_hours.get(stid, 0) + 1
+        c_dayload[(cid, d)] = c_dayload.get((cid, d), 0) + 1
+    return seed
+
+
+def enumerate_tasks(tasks):
+    """(ai, a) juftliklarini qaytaradi (tasks allaqachon (ai,a) formatida)."""
+    for ai, a in tasks:
+        yield ai, a
+
+
 def solve_timetable(data, max_seconds=20):
     school = data["school"]
     days = int(school["daysPerWeek"])
@@ -346,42 +446,24 @@ def solve_timetable(data, max_seconds=20):
                     if (ai, d, s) in x:
                         obj.append(W_EARLY * (slots - s) * x[(ai, d, s)])
 
-    # ===== IKKI BOSQICHLI YECHIM (lexicographic) =====
-    # 1-bosqich: FAQAT maksimal dars joylashtirishni top (tez).
-    # 2-bosqich: o'sha maksimalni saqlagan holda sifatni (gap, muvozanat) yaxshila.
+    # ===== GREEDY WARM-START + BITTA SOLVE =====
+    # Kuchsiz serverda (Render free, 0.1 CPU) CP-SAT'ga vaqt yetmasligi mumkin.
+    # Yechim: avval Python'da TEZ greedy jadval tuzamiz (barcha qattiq shartlarga rioya
+    # qilib), uni CP-SAT'ga "hint" (boshlang'ich yechim) sifatida beramiz. CP-SAT uni
+    # incumbent qilib oladi — natija hech qachon greedy'dan yomon bo'lmaydi, vaqt
+    # yetsa esa undan ancha yaxshi bo'ladi.
     placed_sum = sum(placed[ai][0] for ai in range(len(assignments)))
+
+    seed = _greedy_seed(data, days, slots, teachers, subjects, assignments)
+
+    m.Maximize(sum(obj))
+    for key, var in x.items():
+        m.AddHint(var, 1 if key in seed else 0)
 
     solver = cp_model.CpSolver()
     solver.parameters.num_search_workers = 8
-
-    # 1-bosqich: TEZ maksimal joylashtirishni top (faqat placement, sifatsiz)
-    m.Maximize(placed_sum)
-    solver.parameters.max_time_in_seconds = max(4.0, float(max_seconds) * 0.2)
-    st1 = solver.Solve(m)
-    best_placed = None
-    hint_vars, hint_vals = [], []
-    if st1 in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        best_placed = int(solver.ObjectiveValue())
-        # 1-bosqich yechimini 2-bosqichga "maslahat" (hint) sifatida beramiz -> tezlashadi
-        for key, var in x.items():
-            hint_vars.append(var)
-            hint_vals.append(int(solver.Value(var)))
-
-    # 2-bosqich: joylashtirishni saqlab, SIFATNI (oyna, muvozanat) optimallashtir.
-    status = st1
-    if best_placed is not None:
-        # deyarli hamma dars joylashsin (1-2 dars kamayishiga ruxsat -> oyna kamayadi)
-        m.Add(placed_sum >= best_placed)
-        # umumiy maqsad: placement (juda katta vazn) + sifat
-        m.Maximize(sum(obj))
-        if hint_vars:
-            m.ClearHints()
-            for v, val in zip(hint_vars, hint_vals):
-                m.AddHint(v, val)
-        solver.parameters.max_time_in_seconds = max(8.0, float(max_seconds) * 0.8)
-        st2 = solver.Solve(m)
-        if st2 in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            status = st2
+    solver.parameters.max_time_in_seconds = float(max_seconds)
+    status = solver.Solve(m)
 
     status_name = {
         cp_model.OPTIMAL: "OPTIMAL",
@@ -444,10 +526,10 @@ def solve_timetable(data, max_seconds=20):
 
 
 def _compact(entries, data, days, slots, teachers, subjects):
-    """Har sinf-kun uchun darslarni oldinga suradi (cheklovlarni buzmasdan)."""
-    # tez qidiruv uchun indekslar
-    teacher_busy = set()   # (tid, d, s)
-    room_busy = set()      # (rid, d, s)
+    """Darslarni oldinga suradi (cheklovlarni buzmasdan). Split (guruhli) darslar
+    juft yozuv (A/B) bo'lgani uchun ular YAXLIT hujayra sifatida birga ko'chadi."""
+    teacher_busy = set()
+    room_busy = set()
     for e in entries:
         teacher_busy.add((e["teacherId"], e["day"], e["lesson"]))
         if e.get("roomId"):
@@ -467,55 +549,128 @@ def _compact(entries, data, days, slots, teachers, subjects):
         su = subjects.get(subid)
         return not (su and su.get("unavailable", {}).get(f"{d}-{s}"))
 
-    # sinf -> kun -> darslar ro'yxati
-    from collections import defaultdict
-    by_cd = defaultdict(list)
-    for e in entries:
-        by_cd[(e["classId"], e["day"])].append(e)
+    def cells_of(cid, d):
+        """(cid,d) kunidagi hujayralar: lesson -> [entry, ...] (split juftlik birga)."""
+        out = {}
+        for e in entries:
+            if e["classId"] == cid and e["day"] == d:
+                out.setdefault(e["lesson"], []).append(e)
+        return out
 
+    def can_place_cell(cell, d, s):
+        for e in cell:
+            if (e["teacherId"], d, s) in teacher_busy:
+                return False
+            if e.get("roomId") and (e["roomId"], d, s) in room_busy:
+                return False
+            if not teacher_ok(e["teacherId"], d, s):
+                return False
+            if not subject_ok(e["subjectId"], d, s):
+                return False
+        return True
+
+    def move_cell(cell, nd, ns):
+        for e in cell:
+            teacher_busy.discard((e["teacherId"], e["day"], e["lesson"]))
+            if e.get("roomId"):
+                room_busy.discard((e["roomId"], e["day"], e["lesson"]))
+        for e in cell:
+            e["day"] = nd
+            e["lesson"] = ns
+            teacher_busy.add((e["teacherId"], nd, ns))
+            if e.get("roomId"):
+                room_busy.add((e["roomId"], nd, ns))
+
+    class_ids = sorted(set(e["classId"] for e in entries))
+
+    # 1-BOSQICH: kun ichida oldinga surish
     changed = True
     guard = 0
-    while changed and guard < 50:
+    while changed and guard < 60:
         changed = False
         guard += 1
-        for (cid, d), lst in by_cd.items():
-            occupied = {e["lesson"]: e for e in lst}
-            for target in range(slots):
-                if target in occupied:
-                    continue
-                # target bo'sh — undan keyingi eng yaqin darsni topib oldinga suramiz
-                nxt = None
-                for s in range(target + 1, slots):
-                    if s in occupied:
-                        nxt = s
+        for cid in class_ids:
+            for d in range(days):
+                occ = cells_of(cid, d)
+                for target in range(slots):
+                    if target in occ:
+                        continue
+                    nxt = None
+                    for s in range(target + 1, slots):
+                        if s in occ:
+                            nxt = s
+                            break
+                    if nxt is None:
                         break
-                if nxt is None:
-                    break  # bu kunda boshqa dars yo'q
-                e = occupied[nxt]
-                # e ni (d, target) ga ko'chirish mumkinmi?
-                if (e["teacherId"], d, target) in teacher_busy:
+                    cell = occ[nxt]
+                    # o'z joyidan bo'shatib tekshiramiz (o'zi bilan to'qnashmasin)
+                    for e in cell:
+                        teacher_busy.discard((e["teacherId"], d, nxt))
+                        if e.get("roomId"):
+                            room_busy.discard((e["roomId"], d, nxt))
+                    ok = can_place_cell(cell, d, target)
+                    for e in cell:
+                        teacher_busy.add((e["teacherId"], d, nxt))
+                        if e.get("roomId"):
+                            room_busy.add((e["roomId"], d, nxt))
+                    if ok:
+                        move_cell(cell, d, target)
+                        occ = cells_of(cid, d)
+                        changed = True
+
+    # 2-BOSQICH: kunlararo — bo'sh oynani boshqa kunning OXIRGI darsi bilan to'ldirish
+    changed = True
+    guard = 0
+    while changed and guard < 60:
+        changed = False
+        guard += 1
+        for cid in class_ids:
+            for d in range(days):
+                occ = cells_of(cid, d)
+                if not occ:
                     continue
-                if e.get("roomId") and (e["roomId"], d, target) in room_busy:
+                last = max(occ)
+                gap_slot = None
+                for s in range(last):
+                    if s not in occ:
+                        gap_slot = s
+                        break
+                if gap_slot is None:
                     continue
-                if not teacher_ok(e["teacherId"], d, target):
-                    continue
-                if not subject_ok(e["subjectId"], d, target):
-                    continue
-                # xavfsizlik: bir kunda bir xil fan ikki marta bo'lib qolmasin
-                # (nxt slotdagi fan target'ga ko'chsa, o'sha kunda boshqa nusxa yo'qligini
-                #  tekshiramiz — lekin nxt->target ko'chishida fan o'sha kunda qoladi,
-                #  shuning uchun bu tekshiruv faqat boshqa dars target'da bo'lsa kerak,
-                #  target bo'sh bo'lgani uchun muammo yo'q. Baribir himoya sifatida qoldiramiz.)
-                # ko'chiramiz
-                teacher_busy.discard((e["teacherId"], d, nxt))
-                teacher_busy.add((e["teacherId"], d, target))
-                if e.get("roomId"):
-                    room_busy.discard((e["roomId"], d, nxt))
-                    room_busy.add((e["roomId"], d, target))
-                del occupied[nxt]
-                e["lesson"] = target
-                occupied[target] = e
-                changed = True
+                subj_today = set()
+                for cell in occ.values():
+                    for e in cell:
+                        subj_today.add(e["subjectId"])
+                moved = False
+                for od in range(days):
+                    if od == d or moved:
+                        continue
+                    oocc = cells_of(cid, od)
+                    if not oocc:
+                        continue
+                    o_last = max(oocc)
+                    cell = oocc[o_last]
+                    if any(e["subjectId"] in subj_today for e in cell):
+                        continue
+                    for e in cell:
+                        teacher_busy.discard((e["teacherId"], od, o_last))
+                        if e.get("roomId"):
+                            room_busy.discard((e["roomId"], od, o_last))
+                    ok = can_place_cell(cell, d, gap_slot)
+                    if ok:
+                        for e in cell:
+                            e["day"] = d
+                            e["lesson"] = gap_slot
+                            teacher_busy.add((e["teacherId"], d, gap_slot))
+                            if e.get("roomId"):
+                                room_busy.add((e["roomId"], d, gap_slot))
+                        moved = True
+                        changed = True
+                    else:
+                        for e in cell:
+                            teacher_busy.add((e["teacherId"], od, o_last))
+                            if e.get("roomId"):
+                                room_busy.add((e["roomId"], od, o_last))
 
     return entries
 
