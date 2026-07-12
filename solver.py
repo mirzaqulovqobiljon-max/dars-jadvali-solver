@@ -292,22 +292,25 @@ def solve_timetable(data, max_seconds=20):
     # jami soati kam bo'lsa (masalan boshlang'ich sinf, 5-10 soat), "kunda >=4" sharti
     # imkonsiz bo'lardi — shuning uchun bunday sinflarга yumshoqroq chegara qo'yamiz.
     MIN_PER_DAY = 4
+    import math
     for c in class_ids:
         total_c = sum(int(a.get("hoursPerWeek") or 0)
                       for a in assignments if a["classId"] == c)
-        # bu sinf uchun realistik min: jami soat nechta to'liq kunga bo'linadi
-        # (masalan 5 soatli sinfga "kunda >=4" -> min=4 emas, min=2 xavfsizroq)
         min_day = MIN_PER_DAY
         if total_c < MIN_PER_DAY * 2:      # juda kam darsli sinf
-            min_day = max(1, total_c)      # hammasi bitta kunga (yoki nechta bo'lsa)
+            min_day = max(1, total_c)
         elif total_c < MIN_PER_DAY * days:
             min_day = min(MIN_PER_DAY, max(2, total_c // days + 1))
+        # kunlik YUQORI chegara — darslar barcha kunlarga TEKIS yoyilsin.
+        # ceil(total/days) — eng tekis (masalan 24/6=4, hi=4 -> har kun 4)
+        hi_day = min(slots, max(min_day, math.ceil(total_c / days)))
         for d in D:
             day_load = sum(y[(c, d, s)] for s in S)
             has_day = m.NewBoolVar(f"hasday_{c}_{d}")
             m.Add(day_load >= 1).OnlyEnforceIf(has_day)
             m.Add(day_load == 0).OnlyEnforceIf(has_day.Not())
             m.Add(day_load >= min_day).OnlyEnforceIf(has_day)
+            m.Add(day_load <= hi_day)   # tekis taqsimot
 
     # O'qituvchi bir vaqtda bitta dars (parallel yo'q) — split teacher ham
     teacher_slot = {}  # (tid,d,s) -> list of vars
