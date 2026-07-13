@@ -206,6 +206,10 @@ def solve_timetable(data, max_seconds=20):
     subjects = {s["id"]: s for s in data["subjects"]}
     classes = data["classes"]
     assignments = data["assignments"]
+    class_busy = {}   # cid -> set(busy day indexes)
+    for c in classes:
+        bd = c.get("busyDays") or {}
+        class_busy[c["id"]] = set(int(k) for k, v in bd.items() if v)
 
     # ===== QULFLANGAN SINFLAR (fixedEntries) =====
     # Qulflangan sinf darslari o'z joyida qat'iy qoladi. Ular optimizatsiyaga
@@ -269,6 +273,9 @@ def solve_timetable(data, max_seconds=20):
                 if ok and a.get("isSplit") and a.get("splitTeacherId") and (a["splitTeacherId"], d, s) in fixed_teacher:
                     ok = False
                 if ok and a.get("roomId") and (a["roomId"], d, s) in fixed_room:
+                    ok = False
+                # sinfning band kuni — dars qo'yilmaydi
+                if ok and d in class_busy.get(a["classId"], set()):
                     ok = False
                 if ok:
                     x[(ai, d, s)] = m.NewBoolVar(f"x_{ai}_{d}_{s}")
