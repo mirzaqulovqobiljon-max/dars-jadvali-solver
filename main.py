@@ -33,6 +33,7 @@ class GenerateRequest(BaseModel):
     classes: list
     rooms: list = []
     assignments: list
+    fixedEntries: list = []
     maxSeconds: int = 20
 
 
@@ -50,6 +51,7 @@ def generate(req: GenerateRequest):
         "classes": req.classes,
         "rooms": req.rooms,
         "assignments": req.assignments,
+        "fixedEntries": req.fixedEntries,
     }
     try:
         result = solve_timetable(data, max_seconds=max(3, min(90, int(req.maxSeconds))))
