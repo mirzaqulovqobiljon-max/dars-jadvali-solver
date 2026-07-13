@@ -318,31 +318,31 @@ def solve_timetable(data, max_seconds=20):
             for s in range(slots - 1):
                 m.Add(y[(c, d, s)] >= y[(c, d, s + 1)])
 
-    # ===== QAT'IY: har kun 0 YOKI kamida MIN_PER_DAY soat =====
-    # Kun bo'sh bo'lsa mayli, lekin dars bo'lsa — kamida 4 ta (chala kun bo'lmasin).
-    # DIQQAT: bu shart faqat YETARLI darsli sinflarga qo'llaniladi. Agar sinfning
-    # jami soati kam bo'lsa (masalan boshlang'ich sinf, 5-10 soat), "kunda >=4" sharti
-    # imkonsiz bo'lardi — shuning uchun bunday sinflarга yumshoqroq chegara qo'yamiz.
+    # ===== QAT'IY: har kun 0 YOKI kamida MIN_PER_DAY soat + tekis taqsimot =====
+    # DIQQAT: sinfning BAND KUNLARINI (busyDays) hisobga olamiz — ish kunlari kamayadi.
     MIN_PER_DAY = 4
     import math
     for c in class_ids:
         total_c = sum(int(a.get("hoursPerWeek") or 0)
                       for a in assignments if a["classId"] == c)
-        min_day = MIN_PER_DAY
-        if total_c < MIN_PER_DAY * 2:      # juda kam darsli sinf
-            min_day = max(1, total_c)
-        elif total_c < MIN_PER_DAY * days:
-            min_day = min(MIN_PER_DAY, max(2, total_c // days + 1))
-        # kunlik YUQORI chegara — darslar barcha kunlarga TEKIS yoyilsin.
-        # ceil(total/days) — eng tekis (masalan 24/6=4, hi=4 -> har kun 4)
-        hi_day = min(slots, max(min_day, math.ceil(total_c / days)))
+        busy = class_busy.get(c, set())
+        work_days = max(1, days - len([d for d in D if d in busy]))  # haqiqiy ish kunlari
+        # min_day: kam darsli sinflarni majburlamaymiz (ular joylashsin, "chala kun" mayli)
+        if total_c < MIN_PER_DAY * work_days:
+            min_day = 1          # kam dars -> erkin joylashsin
+        else:
+            min_day = MIN_PER_DAY
+        # yuqori chegara — ish kunlariga tekis yoyilsin (+1 moslashuvchanlik uchun)
+        hi_day = min(slots, max(min_day, math.ceil(total_c / work_days) + 1))
         for d in D:
+            if d in busy:
+                continue  # band kun — cheklov qo'ymaymiz (x allaqachon yo'q)
             day_load = sum(y[(c, d, s)] for s in S)
             has_day = m.NewBoolVar(f"hasday_{c}_{d}")
             m.Add(day_load >= 1).OnlyEnforceIf(has_day)
             m.Add(day_load == 0).OnlyEnforceIf(has_day.Not())
             m.Add(day_load >= min_day).OnlyEnforceIf(has_day)
-            m.Add(day_load <= hi_day)   # tekis taqsimot
+            m.Add(day_load <= hi_day)
 
     # O'qituvchi bir vaqtda bitta dars (parallel yo'q) — split teacher ham
     teacher_slot = {}  # (tid,d,s) -> list of vars
