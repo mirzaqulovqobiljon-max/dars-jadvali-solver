@@ -207,10 +207,28 @@ def solve_timetable(data, max_seconds=20):
     classes = data["classes"]
     assignments = data["assignments"]
 
+    # ===== QULFLANGAN SINFLAR (fixedEntries) =====
+    # Qulflangan sinf darslari o'z joyida qat'iy qoladi. Ular optimizatsiyaga
+    # kirmaydi — solver faqat ochiq sinflarni tuzadi, lekin qulflangan darslar
+    # o'qituvchi/xona bandligiga ta'sir qiladi (to'qnashuv bo'lmasligi uchun).
+    fixed_entries = data.get("fixedEntries") or []
+    locked_class_ids = set(e["classId"] for e in fixed_entries)
+    # qulflangan sinflarga tegishli biriktirishlarni optimizatsiyadan chiqaramiz
+    if locked_class_ids:
+        assignments = [a for a in assignments if a["classId"] not in locked_class_ids]
+
     m = cp_model.CpModel()
 
     D = range(days)
     S = range(slots)
+
+    # qulflangan darslar egallagan (o'qituvchi/xona) slotlar — bandlik
+    fixed_teacher = set()
+    fixed_room = set()
+    for e in fixed_entries:
+        fixed_teacher.add((e["teacherId"], e["day"], e["lesson"]))
+        if e.get("roomId"):
+            fixed_room.add((e["roomId"], e["day"], e["lesson"]))
 
     def teacher_ok(tid, d, s):
         """o'qituvchi (tid) d-kun s-soatda ishlay oladimi (metodik/bandlik)."""
@@ -245,6 +263,13 @@ def solve_timetable(data, max_seconds=20):
                 if ok and a.get("isSplit") and a.get("splitTeacherId"):
                     if not teacher_ok(a["splitTeacherId"], d, s):
                         ok = False
+                # qulflangan darslar bilan to'qnashuv bo'lmasin
+                if ok and (a["teacherId"], d, s) in fixed_teacher:
+                    ok = False
+                if ok and a.get("isSplit") and a.get("splitTeacherId") and (a["splitTeacherId"], d, s) in fixed_teacher:
+                    ok = False
+                if ok and a.get("roomId") and (a["roomId"], d, s) in fixed_room:
+                    ok = False
                 if ok:
                     x[(ai, d, s)] = m.NewBoolVar(f"x_{ai}_{d}_{s}")
 
@@ -556,6 +581,10 @@ def solve_timetable(data, max_seconds=20):
     # Bu deterministik va tez; birinchi bosqichni buzmaydi.
     if entries:
         entries = _compact(entries, data, days, slots, teachers, subjects)
+
+    # Qulflangan sinf darslarini natijaga qaytaramiz (ular o'zgarmagan)
+    if fixed_entries:
+        entries = entries + [dict(e) for e in fixed_entries]
 
     return {
         "entries": entries,
