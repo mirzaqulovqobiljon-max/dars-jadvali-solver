@@ -453,25 +453,36 @@ def solve_timetable(data, max_seconds=20):
                 m.Add(cgap >= after - y[(c, d, s)])
                 obj.append(-W_CGAP * cgap)
 
-    # 2) KUNLAR NOMUTANOSIBLIGI (minimal): har sinf uchun (eng band kun - eng bo'sh kun)
-    #    Chegara YUMSHOQ (objective orqali) — shunda avval maksimal dars joylashadi,
-    #    keyin imkon qadar tekis taqsimlanadi. Qat'iy chegara qo'ymaymiz, aks holda
-    #    kam o'qituvchi holatida ko'p dars "joylashmadi"ga chiqib ketardi.
+    # 2) KUNLAR NOMUTANOSIBLIGI (minimal) + BARCHA ISH KUNLARIDAN FOYDALANISH.
+    #    Har sinf uchun (eng band kun - eng bo'sh kun) ni kamaytiramiz, LEKIN faqat
+    #    ish kunlari bo'yicha (band kunlar hisobga olinmaydi). Ayni paytda har ish
+    #    kunida dars bo'lishini rag'batlantiramiz (bir kun butunlay bo'sh qolmasin).
+    W_EMPTYDAY = 90   # ish kunini bo'sh qoldirish uchun jarima (kuchli)
     for c in class_ids:
         total = sum(int(a.get("hoursPerWeek") or 0)
                     for a in assignments if a["classId"] == c)
         if total <= 0:
             continue
+        busy = class_busy.get(c, set())
+        work_D = [d for d in D if d not in busy]
         loads = []
-        for d in D:
+        for d in work_D:
             load = m.NewIntVar(0, slots, f"load_{c}_{d}")
             m.Add(load == sum(y[(c, d, s)] for s in S))
             loads.append(load)
-        mxl = m.NewIntVar(0, slots, f"mxl_{c}")
-        mnl = m.NewIntVar(0, slots, f"mnl_{c}")
-        m.AddMaxEquality(mxl, loads)
-        m.AddMinEquality(mnl, loads)
-        obj.append(-W_IMBAL * (mxl - mnl))    # nomutanosiblikni kamaytirish
+            # bu ish kunida dars bormi? bo'lmasa jarima
+            hasd = m.NewBoolVar(f"wd_{c}_{d}")
+            m.Add(load >= 1).OnlyEnforceIf(hasd)
+            m.Add(load == 0).OnlyEnforceIf(hasd.Not())
+            # faqat yetarli darsli sinflarda bo'sh kunga jarima (kam darsli sinf bo'sh kun qoldirishi normal)
+            if total >= len(work_D):
+                obj.append(W_EMPTYDAY * hasd)
+        if loads:
+            mxl = m.NewIntVar(0, slots, f"mxl_{c}")
+            mnl = m.NewIntVar(0, slots, f"mnl_{c}")
+            m.AddMaxEquality(mxl, loads)
+            m.AddMinEquality(mnl, loads)
+            obj.append(-W_IMBAL * (mxl - mnl))
 
     # 3) O'QITUVCHI GAPLARI (minimal): o'qituvchining bir kunidagi darslar orasidagi
     #    bo'sh soatlar. Gap = (oxirgi dars slot - birinchi dars slot + 1) - darslar soni.
