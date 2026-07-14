@@ -333,16 +333,34 @@ def solve_timetable(data, max_seconds=20):
         else:
             min_day = MIN_PER_DAY
         # yuqori chegara — ish kunlariga tekis yoyilsin (+1 moslashuvchanlik uchun)
-        hi_day = min(slots, max(min_day, math.ceil(total_c / work_days) + 1))
+        # yuqori chegara — darslarni ish kunlariga TEKIS yoyish uchun uni imkon
+        # qadar past tutamiz (+1 yo'q). Bu bir kunga siqib, boshqa kunni bo'sh
+        # qoldirishning oldini oladi.
+        hi_day = min(slots, max(min_day, math.ceil(total_c / work_days)))
+        # Agar darslar soni ish kunlariga yetsa (har kunga kamida 1 tadan), HAR ish
+        # kunida kamida 1 dars bo'lishini QAT'IY talab qilamiz -> bir kun butunlay
+        # bo'sh qolmaydi (masalan Dushanba bo'sh qolmaydi).
+        force_all_days = total_c >= work_days
+        # har kunga majburiy minimum: darslar barcha kunga yetishi shart.
+        # total_c ni work_days ga bo'lганда butun qism — har kunга kафolatли minimum.
+        forced_min = min(min_day, total_c // work_days) if force_all_days else min_day
+        if forced_min < 1:
+            forced_min = 1
         for d in D:
             if d in busy:
                 continue  # band kun — cheklov qo'ymaymiz (x allaqachon yo'q)
             day_load = sum(y[(c, d, s)] for s in S)
-            has_day = m.NewBoolVar(f"hasday_{c}_{d}")
-            m.Add(day_load >= 1).OnlyEnforceIf(has_day)
-            m.Add(day_load == 0).OnlyEnforceIf(has_day.Not())
-            m.Add(day_load >= min_day).OnlyEnforceIf(has_day)
-            m.Add(day_load <= hi_day)
+            if force_all_days:
+                # har ish kunida kamida forced_min dars (qat'iy) -> bo'sh kun yo'q
+                m.Add(day_load >= forced_min)
+                m.Add(day_load <= hi_day)
+            else:
+                # kam darsli sinf: kun bo'sh bo'lishi mumkin, lekin dars bo'lsa >=min_day
+                has_day = m.NewBoolVar(f"hasday_{c}_{d}")
+                m.Add(day_load >= 1).OnlyEnforceIf(has_day)
+                m.Add(day_load == 0).OnlyEnforceIf(has_day.Not())
+                m.Add(day_load >= min_day).OnlyEnforceIf(has_day)
+                m.Add(day_load <= hi_day)
 
     # O'qituvchi bir vaqtda bitta dars (parallel yo'q) — split teacher ham
     teacher_slot = {}  # (tid,d,s) -> list of vars
