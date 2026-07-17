@@ -35,6 +35,26 @@ Cheklovlar:
    - og'ir fanlar ertaroq soatlarga
 """
 from ortools.sat.python import cp_model
+import math
+
+
+def _expand_half_assignments(assignments):
+    """Kasr (0.5) soatli biriktirishlarni butun + yarim qismlarga ajratadi.
+    Yarim (0.5) dars 1 ta jismoniy slot egallaydi (bir hafta o'tiladi/o'tilmaydi),
+    lekin u '_half=True' bilan belgilanadi -> model uni sinf kunining OXIRGI
+    darsiga qo'yadi. Masalan: 1.5 soat -> 1 butun + 1 yarim; 0.5 -> 1 yarim."""
+    out = []
+    for a in assignments:
+        hrs = float(a.get("hoursPerWeek") or 0)
+        whole = int(math.floor(hrs + 1e-9))
+        has_half = (hrs - whole) >= 0.49
+        if whole > 0:
+            b = dict(a); b["hoursPerWeek"] = whole; b["_half"] = False
+            out.append(b)
+        if has_half:
+            c = dict(a); c["hoursPerWeek"] = 1; c["_half"] = True
+            out.append(c)
+    return out
 
 
 def diagnose(data):
@@ -51,7 +71,7 @@ def diagnose(data):
     cls_names = {c["id"]: c.get("name", c["id"]) for c in data["classes"]}
     cls_load = {}
     for a in data["assignments"]:
-        cls_load[a["classId"]] = cls_load.get(a["classId"], 0) + int(a.get("hoursPerWeek") or 0)
+        cls_load[a["classId"]] = cls_load.get(a["classId"], 0) + math.ceil(float(a.get("hoursPerWeek") or 0))
     for cid, load in cls_load.items():
         if load > total_slots:
             msgs.append(
@@ -63,7 +83,7 @@ def diagnose(data):
     # 2) O'QITUVCHI: bo'sh vaqti / max soatidan ko'p yuk berilganmi?
     t_load = {}
     for a in data["assignments"]:
-        h = int(a.get("hoursPerWeek") or 0)
+        h = math.ceil(float(a.get("hoursPerWeek") or 0))
         t_load[a["teacherId"]] = t_load.get(a["teacherId"], 0) + h
         if a.get("isSplit") and a.get("splitTeacherId"):
             t_load[a["splitTeacherId"]] = t_load.get(a["splitTeacherId"], 0) + h
@@ -221,6 +241,10 @@ def solve_timetable(data, max_seconds=20):
     if locked_class_ids:
         assignments = [a for a in assignments if a["classId"] not in locked_class_ids]
 
+    # Kasr (0.5) soatli darslarni butun + yarim qismlarga ajratamiz.
+    # Shundan keyin barcha hoursPerWeek — butun son (int() endi hech narsa yo'qotmaydi).
+    assignments = _expand_half_assignments(assignments)
+
     m = cp_model.CpModel()
 
     D = range(days)
@@ -317,6 +341,19 @@ def solve_timetable(data, max_seconds=20):
         for d in D:
             for s in range(slots - 1):
                 m.Add(y[(c, d, s)] >= y[(c, d, s + 1)])
+
+    # ===== QAT'IY: YARIM (0.5) DARS — sinf kunining ENG OXIRGI darsi bo'lsin =====
+    # 0.5 soatlik dars bir hafta o'tiladi, bir hafta o'tilmaydi. O'tilmagan haftada
+    # o'rtada bo'sh oyna qolmasligi uchun uni har doim kunning oxirgi darsiga qo'yamiz.
+    # Ya'ni: agar yarim dars (d, s) da bo'lsa, o'sha sinfda (d, s+1) da dars bo'lmasin.
+    for ai, a in enumerate(assignments):
+        if not a.get("_half"):
+            continue
+        cid = a["classId"]
+        for d in D:
+            for s in range(slots - 1):
+                if (ai, d, s) in x:
+                    m.Add(x[(ai, d, s)] + y[(cid, d, s + 1)] <= 1)
 
     # ===== QAT'IY: har kun 0 YOKI kamida MIN_PER_DAY soat + tekis taqsimot =====
     # DIQQAT: sinfning BAND KUNLARINI (busyDays) hisobga olamiz — ish kunlari kamayadi.
@@ -594,6 +631,7 @@ def solve_timetable(data, max_seconds=20):
                             "roomId": a.get("roomId"),
                             "day": d, "lesson": s,
                             "group": "A" if a.get("isSplit") else None,
+                            "isHalf": bool(a.get("_half")),
                         })
                         if a.get("isSplit") and a.get("splitTeacherId"):
                             entries.append({
@@ -603,12 +641,16 @@ def solve_timetable(data, max_seconds=20):
                                 "roomId": a.get("splitRoomId"),
                                 "day": d, "lesson": s,
                                 "group": "B",
+                                "isHalf": bool(a.get("_half")),
                             })
             hours = int(a.get("hoursPerWeek") or 0)
             if got < hours:
+                rem = hours - got
+                # yarim dars joylashmasa — frontend uni ½ chip sifatida ko'rsatishi uchun 0.5
                 unfilled.append({
                     "classId": a["classId"], "subjectId": a["subjectId"],
-                    "teacherId": a["teacherId"], "hours": hours - got,
+                    "teacherId": a["teacherId"],
+                    "hours": (rem * 0.5) if a.get("_half") else rem,
                 })
 
     # ===== 2-BOSQICH: COMPACTION (zichlash) =====
@@ -692,6 +734,21 @@ def _compact(entries, data, days, slots, teachers, subjects):
 
     class_ids = sorted(set(e["classId"] for e in entries))
 
+    # YARIM (0.5) dars — ko'chirilmaydi (u sinf kunining oxirgi darsi bo'lib qolishi
+    # kerak). Shuningdek, tepasida yarim dars turgan oddiy dars ham ko'chirilmaydi
+    # (aks holda yarim dars osilib, oxirgi bo'lmay qoladi).
+    def _cell_has_half(cell):
+        return any(e.get("isHalf") for e in cell)
+
+    def _half_above(cid, d, slot):
+        for e in entries:
+            if e["classId"] == cid and e["day"] == d and e["lesson"] > slot and e.get("isHalf"):
+                return True
+        return False
+
+    def _locked(cell, cid, d, slot):
+        return _cell_has_half(cell) or _half_above(cid, d, slot)
+
     # 1-BOSQICH: kun ichida oldinga surish
     changed = True
     guard = 0
@@ -712,6 +769,8 @@ def _compact(entries, data, days, slots, teachers, subjects):
                     if nxt is None:
                         break
                     cell = occ[nxt]
+                    if _locked(cell, cid, d, nxt):
+                        continue
                     # o'z joyidan bo'shatib tekshiramiz (o'zi bilan to'qnashmasin)
                     for e in cell:
                         teacher_busy.discard((e["teacherId"], d, nxt))
@@ -759,6 +818,8 @@ def _compact(entries, data, days, slots, teachers, subjects):
                         continue
                     o_last = max(oocc)
                     cell = oocc[o_last]
+                    if _locked(cell, cid, od, o_last):
+                        continue
                     if any(e["subjectId"] in subj_today for e in cell):
                         continue
                     for e in cell:
@@ -819,6 +880,8 @@ def _compact(entries, data, days, slots, teachers, subjects):
                         if moved:
                             break
                         cell = oocc[oslot]
+                        if _locked(cell, cid, od, oslot):
+                            continue
                         if any(e["subjectId"] in subj_today for e in cell):
                             continue
                         for e in cell:
@@ -862,6 +925,8 @@ def _compact(entries, data, days, slots, teachers, subjects):
                     if nxt is None:
                         break
                     cell = occ[nxt]
+                    if _locked(cell, cid, d, nxt):
+                        continue
                     for e in cell:
                         teacher_busy.discard((e["teacherId"], d, nxt))
                         if e.get("roomId"):
