@@ -13,7 +13,7 @@ XAVFSIZLIK O'ZGARISHLARI:
   1) CORS faqat o'z domeningizga ochiq (ALLOWED_ORIGINS).
   2) Oddiy IP bo'yicha rate-limit (DoS'ga qarshi).
   3) Kirish hajmi cheklangan (ulkan payload -> 413).
-  4) maxSeconds yuqori chegarasi 30 ga tushirildi.
+  4) maxSeconds clamp qilinadi (rad etilmaydi), yuqori chegara 60.
   5) Umumiy request-body hajmi cheklangan (413).
 """
 import os
@@ -35,10 +35,16 @@ ALLOWED_ORIGINS = [o.strip() for o in os.environ.get(
     "https://darsjadvali2.netlify.app",   # <-- o'z domeningiz
 ).split(",") if o.strip()]
 
+# Netlify preview / boshqa subdomenlar uchun (ixtiyoriy). Bo'sh qoldirsa — ishlamaydi.
+ALLOWED_ORIGIN_REGEX = os.environ.get(
+    "ALLOWED_ORIGIN_REGEX",
+    r"https://.*\.netlify\.app",
+)
+
 RATE_LIMIT = int(os.environ.get("RATE_LIMIT", "20"))        # /generate: N so'rov
 RATE_WINDOW = int(os.environ.get("RATE_WINDOW", "60"))       # har RATE_WINDOW soniyada
 MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", str(2 * 1024 * 1024)))  # 2 MB
-MAX_SECONDS_CAP = int(os.environ.get("MAX_SECONDS_CAP", "30"))
+MAX_SECONDS_CAP = int(os.environ.get("MAX_SECONDS_CAP", "60"))
 
 # Kirish massivlari uchun chegaralar (haddan tashqari kattasini rad etamiz)
 LIMITS = {
@@ -55,6 +61,7 @@ app = FastAPI(title="Dars jadvali solver", version="2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,      # <-- endi "*" EMAS
+    allow_origin_regex=ALLOWED_ORIGIN_REGEX or None,
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type", "Authorization"],
 )
@@ -111,7 +118,10 @@ class GenerateRequest(BaseModel):
     rooms: list = []
     assignments: list
     fixedEntries: list = []
-    maxSeconds: int = Field(default=20, ge=1, le=MAX_SECONDS_CAP)
+    # DIQQAT: maxSeconds hech qachon RAD ETILMAYDI. Katta qiymat yuborilsa ham
+    # server uni o'zi chegaraga tushiradi (clamp). Aks holda frontend 422 olib,
+    # zaif "zaxira" generatorga o'tib ketadi va jadval sifati tushadi.
+    maxSeconds: int = Field(default=20)
 
     @field_validator("teachers", "subjects", "classes", "rooms",
                      "assignments", "fixedEntries")
