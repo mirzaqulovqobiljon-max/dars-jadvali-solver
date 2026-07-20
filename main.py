@@ -44,7 +44,7 @@ ALLOWED_ORIGIN_REGEX = os.environ.get(
 RATE_LIMIT = int(os.environ.get("RATE_LIMIT", "20"))        # /generate: N so'rov
 RATE_WINDOW = int(os.environ.get("RATE_WINDOW", "60"))       # har RATE_WINDOW soniyada
 MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", str(2 * 1024 * 1024)))  # 2 MB
-MAX_SECONDS_CAP = int(os.environ.get("MAX_SECONDS_CAP", "60"))
+MAX_SECONDS_CAP = int(os.environ.get("MAX_SECONDS_CAP", "180"))
 
 # Kirish massivlari uchun chegaralar (haddan tashqari kattasini rad etamiz)
 LIMITS = {
