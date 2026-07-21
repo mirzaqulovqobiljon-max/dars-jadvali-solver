@@ -35,26 +35,6 @@ Cheklovlar:
    - og'ir fanlar ertaroq soatlarga
 """
 from ortools.sat.python import cp_model
-import math
-
-
-def _expand_half_assignments(assignments):
-    """Kasr (0.5) soatli biriktirishlarni butun + yarim qismlarga ajratadi.
-    Yarim (0.5) dars 1 ta jismoniy slot egallaydi (bir hafta o'tiladi/o'tilmaydi),
-    lekin u '_half=True' bilan belgilanadi -> model uni sinf kunining OXIRGI
-    darsiga qo'yadi. Masalan: 1.5 soat -> 1 butun + 1 yarim; 0.5 -> 1 yarim."""
-    out = []
-    for a in assignments:
-        hrs = float(a.get("hoursPerWeek") or 0)
-        whole = int(math.floor(hrs + 1e-9))
-        has_half = (hrs - whole) >= 0.49
-        if whole > 0:
-            b = dict(a); b["hoursPerWeek"] = whole; b["_half"] = False
-            out.append(b)
-        if has_half:
-            c = dict(a); c["hoursPerWeek"] = 1; c["_half"] = True
-            out.append(c)
-    return out
 
 
 def diagnose(data):
@@ -71,7 +51,7 @@ def diagnose(data):
     cls_names = {c["id"]: c.get("name", c["id"]) for c in data["classes"]}
     cls_load = {}
     for a in data["assignments"]:
-        cls_load[a["classId"]] = cls_load.get(a["classId"], 0) + math.ceil(float(a.get("hoursPerWeek") or 0))
+        cls_load[a["classId"]] = cls_load.get(a["classId"], 0) + int(a.get("hoursPerWeek") or 0)
     for cid, load in cls_load.items():
         if load > total_slots:
             msgs.append(
@@ -83,7 +63,7 @@ def diagnose(data):
     # 2) O'QITUVCHI: bo'sh vaqti / max soatidan ko'p yuk berilganmi?
     t_load = {}
     for a in data["assignments"]:
-        h = math.ceil(float(a.get("hoursPerWeek") or 0))
+        h = int(a.get("hoursPerWeek") or 0)
         t_load[a["teacherId"]] = t_load.get(a["teacherId"], 0) + h
         if a.get("isSplit") and a.get("splitTeacherId"):
             t_load[a["splitTeacherId"]] = t_load.get(a["splitTeacherId"], 0) + h
@@ -119,27 +99,14 @@ def diagnose(data):
 
 
 def _greedy_seed(data, days, slots, teachers, subjects, assignments):
-    """Tez greedy jadval — CP-SAT uchun boshlang'ich yechim (hint).
-
-    MUHIM: natija model'ning QAT'IY cheklovlariga mos bo'lishi SHART, aks holda
-    CP-SAT hint'ni rad etadi va noldan qidiradi (natija yomonlashadi).
-    Shuning uchun:
-      * darslar har sinf-kunida 1-soatdan KETMA-KET joylashadi (bo'sh oyna yo'q),
-      * kunlik yuqori chegara (hi_day) hurmat qilinadi,
-      * kunlar imkon qadar tekis to'ldiriladi (min_day ni qanoatlantirish uchun).
-    """
-    import math
-
+    """Tez greedy jadval: barcha qattiq shartlarga rioya qiladi, zich va muvozanatli.
+    Natija: set of (ai, d, s) — CP-SAT uchun boshlang'ich yechim (hint)."""
     t_busy = set()      # (tid, d, s)
     r_busy = set()      # (rid, d, s)
+    c_busy = set()      # (cid, d, s)
     csd = set()         # (cid, subid, d) — bir kunda bir fan
     t_hours = {}        # tid -> jami soat
-    c_dayload = {}      # (cid, d) -> shu kundagi darslar soni (= keyingi bo'sh slot)
-
-    class_busy = {}
-    for c in data.get("classes", []):
-        bd = c.get("busyDays") or {}
-        class_busy[c["id"]] = set(int(k) for k, v in bd.items() if v)
+    c_dayload = {}      # (cid, d) -> soat soni
 
     def teacher_ok(tid, d, s):
         t = teachers.get(tid)
@@ -162,76 +129,56 @@ def _greedy_seed(data, days, slots, teachers, subjects, assignments):
             return True
         return t_hours.get(tid, 0) + extra <= int(mx)
 
-    # Har sinf uchun kunlik yuqori chegara (model bilan bir xil mantiq)
-    MIN_PER_DAY = 4
-    hi_of = {}
-    for c in data.get("classes", []):
-        cid = c["id"]
-        total_c = sum(int(a.get("hoursPerWeek") or 0)
-                      for a in assignments if a["classId"] == cid)
-        work_days = max(1, days - len(class_busy.get(cid, set())))
-        min_day = 1 if total_c < MIN_PER_DAY * work_days else MIN_PER_DAY
-        even = math.ceil(total_c / work_days)
-        slack = 2 if slots - even >= 2 else (1 if slots - even >= 1 else 0)
-        hi_of[cid] = min(slots, max(min_day, even + slack))
-
-    # Eng cheklangan (og'ir yuklangan) o'qituvchilar birinchi joylashsin
+    # Har biriktirishni soatlarga yoyamiz; eng cheklangan (qiyin) o'qituvchilar avval
     tasks = []
     for ai, a in enumerate(assignments):
         for _ in range(int(a.get("hoursPerWeek") or 0)):
             tasks.append((ai, a))
 
-    load_cache = {}
-    for a in assignments:
-        tid = a["teacherId"]
-        load_cache[tid] = load_cache.get(tid, 0) + int(a.get("hoursPerWeek") or 0)
-
     def constraint_score(item):
         ai, a = item
         t = teachers.get(a["teacherId"], {})
-        load = load_cache.get(a["teacherId"], 0)
+        load = sum(int(b.get("hoursPerWeek") or 0) for b in assignments
+                   if b["teacherId"] == a["teacherId"])
         meth = 1 if t.get("methodicalDay") is not None else 0
         unav = len([1 for v in (t.get("unavailable") or {}).values() if v])
-        return -(load * 2 + meth * slots + unav)
+        return -(load * 2 + meth * slots + unav)  # og'ir yuklangan avval
 
     tasks.sort(key=constraint_score)
 
     seed = set()
-    unplaced = []
-
-    def try_place(ai, a):
-        """Faqat KETMA-KET slotga (s == kundagi darslar soni) joylashtiradi."""
+    for ai, a in enumerate_tasks(tasks):
         cid, subid, tid = a["classId"], a["subjectId"], a["teacherId"]
         stid = a.get("splitTeacherId") if a.get("isSplit") else None
-        busy_days = class_busy.get(cid, set())
-        hi = hi_of.get(cid, slots)
-        best, best_score = None, None
+        best = None
+        best_score = None
         for d in range(days):
-            if d in busy_days:
-                continue
             if (cid, subid, d) in csd:
                 continue
-            s = c_dayload.get((cid, d), 0)      # <-- ketma-ketlik kafolati
-            if s >= slots or s >= hi:
-                continue
-            if (tid, d, s) in t_busy or not teacher_ok(tid, d, s):
-                continue
-            if stid and ((stid, d, s) in t_busy or not teacher_ok(stid, d, s)):
-                continue
-            if not subject_ok(subid, d, s):
-                continue
-            if a.get("roomId") and (a["roomId"], d, s) in r_busy:
-                continue
-            # Kunlarni tekis to'ldiramiz: kam yuklangan kun afzal
-            sc = -s * 10 - c_dayload.get((cid, d), 0) * 3
-            if best_score is None or sc > best_score:
-                best_score, best = sc, (d, s)
+            for s in range(slots):
+                if (cid, d, s) in c_busy:
+                    continue
+                if (tid, d, s) in t_busy or not teacher_ok(tid, d, s):
+                    continue
+                if stid and ((stid, d, s) in t_busy or not teacher_ok(stid, d, s)):
+                    continue
+                if not subject_ok(subid, d, s):
+                    continue
+                if a.get("roomId") and (a["roomId"], d, s) in r_busy:
+                    continue
+                # ball: zichlik (slot == shu kundagi darslar soni -> oynasiz) + muvozanat
+                dl = c_dayload.get((cid, d), 0)
+                sc = -abs(s - dl) * 10 - dl * 3 - s
+                if best_score is None or sc > best_score:
+                    best_score = sc
+                    best = (d, s)
         if best is None:
-            return False
+            continue
         if not teacher_cap_ok(tid) or (stid and not teacher_cap_ok(stid)):
-            return False
+            continue
         d, s = best
         seed.add((ai, d, s))
+        c_busy.add((cid, d, s))
         t_busy.add((tid, d, s))
         if stid:
             t_busy.add((stid, d, s))
@@ -241,20 +188,7 @@ def _greedy_seed(data, days, slots, teachers, subjects, assignments):
         t_hours[tid] = t_hours.get(tid, 0) + 1
         if stid:
             t_hours[stid] = t_hours.get(stid, 0) + 1
-        c_dayload[(cid, d)] = s + 1
-        return True
-
-    for ai, a in enumerate_tasks(tasks):
-        if not try_place(ai, a):
-            unplaced.append((ai, a))
-
-    # 2-urinish: qolganlarini yana bir marta sinaymiz (holat o'zgargan bo'lishi mumkin)
-    if unplaced:
-        again, unplaced = unplaced, []
-        for ai, a in again:
-            if not try_place(ai, a):
-                unplaced.append((ai, a))
-
+        c_dayload[(cid, d)] = c_dayload.get((cid, d), 0) + 1
     return seed
 
 
@@ -286,10 +220,6 @@ def solve_timetable(data, max_seconds=20):
     # qulflangan sinflarga tegishli biriktirishlarni optimizatsiyadan chiqaramiz
     if locked_class_ids:
         assignments = [a for a in assignments if a["classId"] not in locked_class_ids]
-
-    # Kasr (0.5) soatli darslarni butun + yarim qismlarga ajratamiz.
-    # Shundan keyin barcha hoursPerWeek — butun son (int() endi hech narsa yo'qotmaydi).
-    assignments = _expand_half_assignments(assignments)
 
     m = cp_model.CpModel()
 
@@ -388,19 +318,6 @@ def solve_timetable(data, max_seconds=20):
             for s in range(slots - 1):
                 m.Add(y[(c, d, s)] >= y[(c, d, s + 1)])
 
-    # ===== QAT'IY: YARIM (0.5) DARS — sinf kunining ENG OXIRGI darsi bo'lsin =====
-    # 0.5 soatlik dars bir hafta o'tiladi, bir hafta o'tilmaydi. O'tilmagan haftada
-    # o'rtada bo'sh oyna qolmasligi uchun uni har doim kunning oxirgi darsiga qo'yamiz.
-    # Ya'ni: agar yarim dars (d, s) da bo'lsa, o'sha sinfda (d, s+1) da dars bo'lmasin.
-    for ai, a in enumerate(assignments):
-        if not a.get("_half"):
-            continue
-        cid = a["classId"]
-        for d in D:
-            for s in range(slots - 1):
-                if (ai, d, s) in x:
-                    m.Add(x[(ai, d, s)] + y[(cid, d, s + 1)] <= 1)
-
     # ===== QAT'IY: har kun 0 YOKI kamida MIN_PER_DAY soat + tekis taqsimot =====
     # DIQQAT: sinfning BAND KUNLARINI (busyDays) hisobga olamiz — ish kunlari kamayadi.
     MIN_PER_DAY = 4
@@ -415,20 +332,11 @@ def solve_timetable(data, max_seconds=20):
             min_day = 1          # kam dars -> erkin joylashsin
         else:
             min_day = MIN_PER_DAY
-        # ===== YUQORI CHEGARA (hi_day) =====
-        # MUHIM TUZATISH: ilgari hi_day = ceil(total/work_days) QAT'IY edi.
-        # Bu katta maktablarda halokatli: masalan 30 soat / 6 kun -> hi_day=5,
-        # ya'ni 6- va 7-soatlar BUTUNLAY bloklanardi. Natijada bo'sh kataklar
-        # ko'rinib tursa ham darslar joylashmasdi (o'qituvchilar erta soatlarda
-        # to'qnashib qolardi).
-        #
-        # Endi: qat'iy chegaraga BO'SHLIQ (slack) beramiz — solver zarur bo'lganda
-        # kunni uzaytira oladi. Tekis taqsimot esa ob'ektiv funksiyadagi W_IMBAL
-        # jarimasi orqali (YUMSHOQ) ta'minlanadi — ya'ni imkon bo'lsa tekis,
-        # imkon bo'lmasa dars joylashadi.
-        even = math.ceil(total_c / work_days) if work_days else slots
-        slack = 2 if slots - even >= 2 else (1 if slots - even >= 1 else 0)
-        hi_day = min(slots, max(min_day, even + slack))
+        # yuqori chegara — ish kunlariga tekis yoyilsin (+1 moslashuvchanlik uchun)
+        # yuqori chegara — darslarni ish kunlariga TEKIS yoyish uchun uni imkon
+        # qadar past tutamiz (+1 yo'q). Bu bir kunga siqib, boshqa kunni bo'sh
+        # qoldirishning oldini oladi.
+        hi_day = min(slots, max(min_day, math.ceil(total_c / work_days)))
         # Agar darslar soni ish kunlariga yetsa (har kunga kamida 1 tadan), HAR ish
         # kunida kamida 1 dars bo'lishini QAT'IY talab qilamiz -> bir kun butunlay
         # bo'sh qolmaydi (masalan Dushanba bo'sh qolmaydi).
@@ -491,19 +399,62 @@ def solve_timetable(data, max_seconds=20):
     for a in assignments:
         key = (a["classId"], a["subjectId"])
         subj_week_hours[key] = subj_week_hours.get(key, 0) + int(a.get("hoursPerWeek") or 0)
-    csd = {}
+    # JUFT DARS (subject.doubleLesson = True): kuniga ko'pi bilan 2 dars va ular
+    # ALBATTA KETMA-KET bo'lishi SHART (masalan 3- va 4-soat).
+    csd = {}   # (cid, subid, d) -> {slot: [var, ...]}
     for ai, a in enumerate(assignments):
         for d in D:
             key = (a["classId"], a["subjectId"], d)
             for s in S:
                 if (ai, d, s) in x:
-                    csd.setdefault(key, []).append(x[(ai, d, s)])
-    for key, lst in csd.items():
+                    csd.setdefault(key, {}).setdefault(s, []).append(x[(ai, d, s)])
+
+    # yakka (juftlanmagan) darslar — objectivega yumshoq jarima sifatida qo'shiladi
+    double_singles = []
+
+    for key, slot_map in csd.items():
         cid, subid, d = key
-        wh = subj_week_hours.get((cid, subid), 0)
-        max_per_day = 2 if wh > days else 1
-        if len(lst) > max_per_day:
-            m.Add(sum(lst) <= max_per_day)
+        su = subjects.get(subid) or {}
+        is_double = bool(su.get("doubleLesson"))
+        all_vars = [v for lst in slot_map.values() for v in lst]
+        if not all_vars:
+            continue
+
+        if is_double:
+            # kuniga ko'pi bilan 2 dars
+            if len(all_vars) > 2:
+                m.Add(sum(all_vars) <= 2)
+
+            # z[s] = shu fan shu sinfda (d, s) da bormi
+            z = {}
+            for s in S:
+                zs = m.NewBoolVar(f"z_{cid}_{subid}_{d}_{s}")
+                lst = slot_map.get(s, [])
+                if lst:
+                    m.Add(zs == sum(lst))
+                else:
+                    m.Add(zs == 0)
+                z[s] = zs
+
+            # QAT'IY: ikki dars orasida bo'shliq bo'lishi mumkin emas.
+            # |s1 - s2| >= 2 bo'lgan har qanday juftlik taqiqlanadi.
+            for s1 in S:
+                for s2 in range(s1 + 2, slots):
+                    m.Add(z[s1] + z[s2] <= 1)
+
+            # YUMSHOQ: yakka dars uchun jarima -> solver juftlashga intiladi.
+            # cnt in {0,1,2}; is2 = (cnt == 2); single = cnt - 2*is2 in {0,1}
+            cnt = m.NewIntVar(0, 2, f"dcnt_{cid}_{subid}_{d}")
+            m.Add(cnt == sum(z[s] for s in S))
+            is2 = m.NewBoolVar(f"dis2_{cid}_{subid}_{d}")
+            m.Add(cnt >= 2).OnlyEnforceIf(is2)
+            m.Add(cnt <= 1).OnlyEnforceIf(is2.Not())
+            double_singles.append(cnt - 2 * is2)
+        else:
+            wh = subj_week_hours.get((cid, subid), 0)
+            max_per_day = 2 if wh > days else 1
+            if len(all_vars) > max_per_day:
+                m.Add(sum(all_vars) <= max_per_day)
 
     # O'qituvchi haftalik maksimal soati
     teacher_all = {}
@@ -537,6 +488,7 @@ def solve_timetable(data, max_seconds=20):
     W_IMBAL = 12
     W_TGAP = 2
     W_EARLY = 1
+    W_PAIR = 60     # juft darsning yakka qolishiga jarima (kuchli, lekin yumshoq)
 
     obj = []
 
@@ -562,6 +514,10 @@ def solve_timetable(data, max_seconds=20):
                 m.Add(cgap <= 1 - y[(c, d, s)])
                 m.Add(cgap >= after - y[(c, d, s)])
                 obj.append(-W_CGAP * cgap)
+
+    # 1c) JUFT DARSLAR: yakka qolgan darsga jarima -> imkon qadar juft joylashadi
+    for expr in double_singles:
+        obj.append(-W_PAIR * expr)
 
     # 2) KUNLAR NOMUTANOSIBLIGI (minimal) + BARCHA ISH KUNLARIDAN FOYDALANISH.
     #    Har sinf uchun (eng band kun - eng bo'sh kun) ni kamaytiramiz, LEKIN faqat
@@ -672,51 +628,36 @@ def solve_timetable(data, max_seconds=20):
 
     entries = []
     unfilled = []
-    used_fallback = False
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        source = {key for key, var in x.items() if solver.Value(var) == 1}
-    else:
-        # ===== ZAXIRA: CP-SAT vaqt ichida yechim topmadi (UNKNOWN/INFEASIBLE) =====
-        # Bunday holatda AVVAL bo'sh jadval qaytarilardi — foydalanuvchi hech narsa
-        # ko'rmasdi. Endi greedy yechimдан foydalanamiz: u barcha qat'iy qoidalarga
-        # mos (oynasiz, to'qnashuvsiz), shuning uchun xavfsiz.
-        source = set(seed)
-        used_fallback = True
-
-    got_count = {}
-    for (ai, d, s) in sorted(source):
-        a = assignments[ai]
-        got_count[ai] = got_count.get(ai, 0) + 1
-        entries.append({
-            "classId": a["classId"],
-            "subjectId": a["subjectId"],
-            "teacherId": a["teacherId"],
-            "roomId": a.get("roomId"),
-            "day": d, "lesson": s,
-            "group": "A" if a.get("isSplit") else None,
-            "isHalf": bool(a.get("_half")),
-        })
-        if a.get("isSplit") and a.get("splitTeacherId"):
-            entries.append({
-                "classId": a["classId"],
-                "subjectId": a["subjectId"],
-                "teacherId": a["splitTeacherId"],
-                "roomId": a.get("splitRoomId"),
-                "day": d, "lesson": s,
-                "group": "B",
-                "isHalf": bool(a.get("_half")),
-            })
-    for ai, a in enumerate(assignments):
-        hours = int(a.get("hoursPerWeek") or 0)
-        got = got_count.get(ai, 0)
-        if got < hours:
-            rem = hours - got
-            # yarim dars joylashmasa — frontend uni ½ chip sifatida ko'rsatishi uchun 0.5
-            unfilled.append({
-                "classId": a["classId"], "subjectId": a["subjectId"],
-                "teacherId": a["teacherId"],
-                "hours": (rem * 0.5) if a.get("_half") else rem,
-            })
+        for ai, a in enumerate(assignments):
+            got = 0
+            for d in D:
+                for s in S:
+                    if (ai, d, s) in x and solver.Value(x[(ai, d, s)]) == 1:
+                        got += 1
+                        entries.append({
+                            "classId": a["classId"],
+                            "subjectId": a["subjectId"],
+                            "teacherId": a["teacherId"],
+                            "roomId": a.get("roomId"),
+                            "day": d, "lesson": s,
+                            "group": "A" if a.get("isSplit") else None,
+                        })
+                        if a.get("isSplit") and a.get("splitTeacherId"):
+                            entries.append({
+                                "classId": a["classId"],
+                                "subjectId": a["subjectId"],
+                                "teacherId": a["splitTeacherId"],
+                                "roomId": a.get("splitRoomId"),
+                                "day": d, "lesson": s,
+                                "group": "B",
+                            })
+            hours = int(a.get("hoursPerWeek") or 0)
+            if got < hours:
+                unfilled.append({
+                    "classId": a["classId"], "subjectId": a["subjectId"],
+                    "teacherId": a["teacherId"], "hours": hours - got,
+                })
 
     # ===== 2-BOSQICH: COMPACTION (zichlash) =====
     # CP-SAT natijasidan keyin darslarni kun ichida oldinga suramiz (bo'sh oynani
@@ -725,20 +666,6 @@ def solve_timetable(data, max_seconds=20):
     if entries:
         entries = _compact(entries, data, days, slots, teachers, subjects)
 
-    # ===== 3-BOSQICH: QOLGAN DARSLARNI JOYLASHTIRISH (repair) =====
-    # CP-SAT vaqt yetmasligi sababli ba'zi darslarni qoldirishi mumkin, holbuki
-    # jadvalda bo'sh kataklar bor. Bu bosqich shunday darslarni deterministik
-    # ravishda bo'sh joylarga qo'yadi — barcha qat'iy qoidalarga rioya qilgan holda:
-    #   * sinf kunida darslar ketma-ket (bo'sh oyna paydo bo'lmaydi),
-    #   * o'qituvchi/xona to'qnashuvi yo'q,
-    #   * bir fan bir kunda takrorlanmaydi,
-    #   * metodik kun va band kunlar hurmat qilinadi.
-    if unfilled:
-        entries, unfilled = _fill_remaining(
-            entries, unfilled, data, days, slots, teachers, subjects,
-            fixed_teacher, fixed_room
-        )
-
     # Qulflangan sinf darslarini natijaga qaytaramiz (ular o'zgarmagan)
     if fixed_entries:
         entries = entries + [dict(e) for e in fixed_entries]
@@ -746,13 +673,11 @@ def solve_timetable(data, max_seconds=20):
     return {
         "entries": entries,
         "unfilled": unfilled,
-        "status": ("FALLBACK" if used_fallback else status_name),
+        "status": status_name,
         "stats": {
             "objective": solver.ObjectiveValue() if status in (cp_model.OPTIMAL, cp_model.FEASIBLE) else None,
             "wall_time": solver.WallTime(),
             "placed": len(entries),
-            "fallback": used_fallback,
-            "solver_status": status_name,
         },
     }
 
@@ -815,21 +740,6 @@ def _compact(entries, data, days, slots, teachers, subjects):
 
     class_ids = sorted(set(e["classId"] for e in entries))
 
-    # YARIM (0.5) dars — ko'chirilmaydi (u sinf kunining oxirgi darsi bo'lib qolishi
-    # kerak). Shuningdek, tepasida yarim dars turgan oddiy dars ham ko'chirilmaydi
-    # (aks holda yarim dars osilib, oxirgi bo'lmay qoladi).
-    def _cell_has_half(cell):
-        return any(e.get("isHalf") for e in cell)
-
-    def _half_above(cid, d, slot):
-        for e in entries:
-            if e["classId"] == cid and e["day"] == d and e["lesson"] > slot and e.get("isHalf"):
-                return True
-        return False
-
-    def _locked(cell, cid, d, slot):
-        return _cell_has_half(cell) or _half_above(cid, d, slot)
-
     # 1-BOSQICH: kun ichida oldinga surish
     changed = True
     guard = 0
@@ -850,8 +760,6 @@ def _compact(entries, data, days, slots, teachers, subjects):
                     if nxt is None:
                         break
                     cell = occ[nxt]
-                    if _locked(cell, cid, d, nxt):
-                        continue
                     # o'z joyidan bo'shatib tekshiramiz (o'zi bilan to'qnashmasin)
                     for e in cell:
                         teacher_busy.discard((e["teacherId"], d, nxt))
@@ -899,8 +807,6 @@ def _compact(entries, data, days, slots, teachers, subjects):
                         continue
                     o_last = max(oocc)
                     cell = oocc[o_last]
-                    if _locked(cell, cid, od, o_last):
-                        continue
                     if any(e["subjectId"] in subj_today for e in cell):
                         continue
                     for e in cell:
@@ -961,8 +867,6 @@ def _compact(entries, data, days, slots, teachers, subjects):
                         if moved:
                             break
                         cell = oocc[oslot]
-                        if _locked(cell, cid, od, oslot):
-                            continue
                         if any(e["subjectId"] in subj_today for e in cell):
                             continue
                         for e in cell:
@@ -1006,8 +910,6 @@ def _compact(entries, data, days, slots, teachers, subjects):
                     if nxt is None:
                         break
                     cell = occ[nxt]
-                    if _locked(cell, cid, d, nxt):
-                        continue
                     for e in cell:
                         teacher_busy.discard((e["teacherId"], d, nxt))
                         if e.get("roomId"):
@@ -1029,147 +931,3 @@ if __name__ == "__main__":
     import json, sys
     data = json.load(sys.stdin)
     print(json.dumps(solve_timetable(data)))
-
-
-def _fill_remaining(entries, unfilled, data, days, slots, teachers, subjects,
-                    fixed_teacher=None, fixed_room=None):
-    """CP-SAT joylashtira olmagan darslarni bo'sh kataklarga qo'yadi.
-
-    Qat'iy qoidalar (hech qachon buzilmaydi):
-      * sinf bir vaqtda bitta dars,
-      * o'qituvchi bir vaqtda bitta dars (qulflangan darslar ham hisobga olinadi),
-      * xona bir vaqtda bitta dars,
-      * bir fan bir kunda takrorlanmaydi,
-      * metodik kun / band kun / band soat,
-      * dars faqat kunning KEYINGI bo'sh slotiga qo'yiladi -> bo'sh oyna paydo bo'lmaydi,
-      * yarim (0.5) dars faqat kunning oxirgi darsi bo'la oladi.
-
-    Qaytaradi: (yangilangan entries, qolgan unfilled)
-    """
-    fixed_teacher = fixed_teacher or set()
-    fixed_room = fixed_room or set()
-
-    class_busy = {}
-    for c in data.get("classes", []):
-        bd = c.get("busyDays") or {}
-        class_busy[c["id"]] = set(int(k) for k, v in bd.items() if v)
-
-    # Joriy holat
-    occupied = {}       # (cid, d, s) -> True
-    dayload = {}        # (cid, d) -> nechta dars (ketma-ket bo'lgani uchun = keyingi slot)
-    t_busy = set(fixed_teacher)
-    r_busy = set(fixed_room)
-    csd = set()         # (cid, subid, d)
-    half_at = set()     # (cid, d, s) — yarim dars turgan joy
-
-    for e in entries:
-        key = (e["classId"], e["day"], e["lesson"])
-        occupied[key] = True
-        t_busy.add((e["teacherId"], e["day"], e["lesson"]))
-        if e.get("roomId"):
-            r_busy.add((e["roomId"], e["day"], e["lesson"]))
-        csd.add((e["classId"], e["subjectId"], e["day"]))
-        if e.get("isHalf"):
-            half_at.add(key)
-
-    # Har sinf-kun uchun band slotlar soni (ketma-ket deb hisoblaymiz)
-    for (cid, d, s) in list(occupied.keys()):
-        dayload[(cid, d)] = max(dayload.get((cid, d), 0), s + 1)
-
-    def teacher_ok(tid, d, s):
-        t = teachers.get(tid)
-        if not t:
-            return False
-        if t.get("methodicalDay") is not None and int(t["methodicalDay"]) == d:
-            return False
-        if t.get("unavailable", {}).get(f"{d}-{s}"):
-            return False
-        return True
-
-    def subject_ok(subid, d, s):
-        su = subjects.get(subid)
-        return not (su and su.get("unavailable", {}).get(f"{d}-{s}"))
-
-    # Assignment ma'lumotlarini topish uchun indeks (split/xona uchun)
-    a_index = {}
-    for a in data.get("assignments", []):
-        a_index[(a["classId"], a["subjectId"], a["teacherId"])] = a
-
-    still = []
-    for u in unfilled:
-        cid, subid, tid = u["classId"], u["subjectId"], u["teacherId"]
-        hours = u.get("hours") or 0
-        is_half = (abs(hours - round(hours)) > 1e-6)   # 0.5, 1.5 ...
-        a = a_index.get((cid, subid, tid), {})
-        stid = a.get("splitTeacherId") if a.get("isSplit") else None
-        rid = a.get("roomId")
-        srid = a.get("splitRoomId")
-
-        remaining = hours
-        step = 0.5 if is_half else 1
-        guard = 0
-        while remaining > 1e-6 and guard < 200:
-            guard += 1
-            placed_one = False
-            # Kunlarni kam yuklangan tartibda ko'rib chiqamiz (tekis taqsimot)
-            day_order = sorted(range(days), key=lambda dd: dayload.get((cid, dd), 0))
-            for d in day_order:
-                if d in class_busy.get(cid, set()):
-                    continue
-                if (cid, subid, d) in csd:
-                    continue                      # bir fan kunda bir marta
-                s = dayload.get((cid, d), 0)
-                if s >= slots:
-                    continue                      # kun to'lgan
-                if (cid, d, s) in occupied:
-                    continue
-                # yarim dars ustidagi katakka dars qo'ymaymiz
-                if (cid, d, s - 1) in half_at:
-                    continue
-                if not teacher_ok(tid, d, s) or (tid, d, s) in t_busy:
-                    continue
-                if stid and (not teacher_ok(stid, d, s) or (stid, d, s) in t_busy):
-                    continue
-                if not subject_ok(subid, d, s):
-                    continue
-                if rid and (rid, d, s) in r_busy:
-                    continue
-                if srid and (srid, d, s) in r_busy:
-                    continue
-
-                # JOYLASHTIRAMIZ
-                half_flag = (step == 0.5)
-                entries.append({
-                    "classId": cid, "subjectId": subid, "teacherId": tid,
-                    "roomId": rid, "day": d, "lesson": s,
-                    "group": "A" if stid else None, "isHalf": half_flag,
-                })
-                if stid:
-                    entries.append({
-                        "classId": cid, "subjectId": subid, "teacherId": stid,
-                        "roomId": srid, "day": d, "lesson": s,
-                        "group": "B", "isHalf": half_flag,
-                    })
-                occupied[(cid, d, s)] = True
-                dayload[(cid, d)] = s + 1
-                t_busy.add((tid, d, s))
-                if stid:
-                    t_busy.add((stid, d, s))
-                if rid:
-                    r_busy.add((rid, d, s))
-                if srid:
-                    r_busy.add((srid, d, s))
-                csd.add((cid, subid, d))
-                if half_flag:
-                    half_at.add((cid, d, s))
-                remaining -= step
-                placed_one = True
-                break
-            if not placed_one:
-                break
-
-        if remaining > 1e-6:
-            still.append({"classId": cid, "subjectId": subid,
-                          "teacherId": tid, "hours": round(remaining, 1)})
-
-    return entries, still
