@@ -54,7 +54,14 @@ class GenerateRequest(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "ai": bool(os.environ.get("GEMINI_API_KEY"))}
+    key = os.environ.get("GEMINI_API_KEY", "").strip()
+    model = None
+    if key:
+        try:
+            model = _pick_model(key)
+        except Exception:
+            model = None
+    return {"status": "ok", "ai": bool(key), "model": model}
 
 
 @app.post("/generate")
@@ -117,6 +124,91 @@ def _rate_ok(ip: str) -> bool:
     return True
 
 
+LIST_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+
+# Ustuvorlik tartibi: arzon va tez modeldan boshlab qidiramiz.
+# Google model nomlarini vaqti-vaqti bilan o'zgartiradi, shuning uchun
+# ro'yxat API dan olinadi — kodga qattiq yozilmaydi.
+MODEL_PREFERENCE = [
+    "flash-lite",
+    "flash",
+    "pro",
+]
+
+_model_cache = {"name": None, "at": 0}
+
+
+def _fetch_models(key: str):
+    """Kalit uchun ruxsat etilgan modellar ro'yxati."""
+    req = urllib.request.Request(
+        LIST_URL, headers={"x-goog-api-key": key}, method="GET"
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    out = []
+    for m in payload.get("models", []):
+        methods = m.get("supportedGenerationMethods", []) or m.get(
+            "supportedActions", []
+        )
+        if "generateContent" not in methods:
+            continue
+        name = m.get("name", "")
+        if name.startswith("models/"):
+            name = name[len("models/"):]
+        if not name:
+            continue
+        out.append(name)
+    return out
+
+
+def _pick_model(key: str) -> str:
+    """GEMINI_MODEL berilmagan bo'lsa, mavjudlaridan mosini tanlaydi."""
+    forced = os.environ.get("GEMINI_MODEL", "").strip()
+    if forced:
+        return forced
+    now = time.time()
+    if _model_cache["name"] and now - _model_cache["at"] < 3600:
+        return _model_cache["name"]
+    names = _fetch_models(key)
+    chosen = None
+    for want in MODEL_PREFERENCE:
+        cands = [n for n in names if want in n and "vision" not in n
+                 and "embedding" not in n and "image" not in n]
+        if cands:
+            # eng qisqa nom odatda barqaror (preview/exp suffikssiz) versiya
+            cands.sort(key=lambda x: (("preview" in x) + ("exp" in x), len(x)))
+            chosen = cands[0]
+            break
+    if not chosen and names:
+        chosen = names[0]
+    if not chosen:
+        raise RuntimeError("Kalit uchun birorta model mavjud emas")
+    _model_cache["name"] = chosen
+    _model_cache["at"] = now
+    return chosen
+
+
+@app.get("/ai/models")
+def ai_models():
+    """Kalitingiz uchun qaysi modellar ochiqligini ko'rsatadi (nosozlikni topish uchun)."""
+    key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not key:
+        return {"ok": False, "error": "GEMINI_API_KEY o'rnatilmagan"}
+    try:
+        names = _fetch_models(key)
+    except urllib.error.HTTPError as e:
+        return {"ok": False, "error": "HTTP %s — kalit noto'g'ri bo'lishi mumkin" % e.code}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:200]}
+    try:
+        picked = _pick_model(key)
+    except Exception as e:
+        picked = None
+    return {"ok": True, "count": len(names), "models": names,
+            "selected": picked,
+            "forced": os.environ.get("GEMINI_MODEL", "").strip() or None}
+
+
 class ExplainRequest(BaseModel):
     summary: str
     question: str = ""
@@ -135,7 +227,12 @@ def ai_explain(req: ExplainRequest, ):
     if len(summary) > MAX_SUMMARY_CHARS:
         summary = summary[:MAX_SUMMARY_CHARS]
 
-    model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip()
+    try:
+        model = _pick_model(key)
+    except Exception as e:
+        return {"ok": False,
+                "error": "Model aniqlanmadi: %s. /ai/models manzilini ochib tekshiring."
+                         % str(e)[:150]}
     user_text = summary
     if req.question:
         user_text += "\n\nQO'SHIMCHA SAVOL: " + req.question[:500]
@@ -162,9 +259,11 @@ def ai_explain(req: ExplainRequest, ):
         except Exception:
             pass
         if e.code == 404:
+            _model_cache["name"] = None      # keshni tozalab, keyingi safar qayta qidiramiz
             return {"ok": False,
-                    "error": "Model topilmadi: '%s'. GEMINI_MODEL o'zgaruvchisini "
-                             "to'g'rilang (masalan gemini-2.5-flash)." % model}
+                    "error": "Model topilmadi: '%s'. Render'dagi GEMINI_MODEL "
+                             "o'zgaruvchisini O'CHIRING — tizim mos modelni o'zi "
+                             "tanlaydi. Mavjudlarini ko'rish: /ai/models" % model}
         if e.code in (401, 403):
             return {"ok": False, "error": "API kalit noto'g'ri yoki muddati tugagan."}
         if e.code == 429:
