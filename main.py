@@ -1,115 +1,46 @@
 """
-Dars jadvali — OR-Tools CP-SAT web API (FastAPI). XAVFSIZ (hardened) versiya.
+Dars jadvali — OR-Tools CP-SAT web API (FastAPI).
 
 Ishga tushirish (lokal):
     pip install -r requirements.txt
     uvicorn main:app --host 0.0.0.0 --port 8000
 
 Endpoint:
-    POST /generate   -> jadval yaratadi (JSON kirish/chiqish)
-    GET  /health     -> "ok"
+    POST /generate    -> jadval yaratadi (JSON kirish/chiqish)
+    POST /ai/explain  -> "nega joylashmadi?" tahlili (Gemini orqali)
+    GET  /health      -> "ok"
 
-XAVFSIZLIK O'ZGARISHLARI:
-  1) CORS faqat o'z domeningizga ochiq (ALLOWED_ORIGINS).
-  2) Oddiy IP bo'yicha rate-limit (DoS'ga qarshi).
-  3) Kirish hajmi cheklangan (ulkan payload -> 413).
-  4) maxSeconds clamp qilinadi (rad etilmaydi), yuqori chegara 60.
-  5) Umumiy request-body hajmi cheklangan (413).
+MUHIT O'ZGARUVCHILARI (Render -> Environment):
+    GEMINI_API_KEY = <aistudio.google.com/apikey dan olingan kalit>
+    GEMINI_MODEL   = gemini-2.5-flash        (ixtiyoriy)
+    AI_RATE_PER_HOUR = 30                    (ixtiyoriy, bitta IP uchun)
+
+DIQQAT: kalit hech qachon kod ichida yozilmaydi va javobda qaytarilmaydi.
 """
+import json
 import os
 import time
-import threading
-from collections import defaultdict, deque
-
-from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, field_validator
+import urllib.error
+import urllib.request
+from collections import defaultdict
 from typing import Any, Dict
 
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from solver import solve_timetable
 
-# --- Sozlamalar (Render'da Environment Variables orqali o'zgartiring) ---
-ALLOWED_ORIGINS = [o.strip() for o in os.environ.get(
-    "ALLOWED_ORIGINS",
-    "https://darsjadvali2.netlify.app",   # <-- o'z domeningiz
-).split(",") if o.strip()]
+app = FastAPI(title="Dars jadvali solver", version="1.1")
 
-# Netlify preview / boshqa subdomenlar uchun (ixtiyoriy). Bo'sh qoldirsa — ishlamaydi.
-ALLOWED_ORIGIN_REGEX = os.environ.get(
-    "ALLOWED_ORIGIN_REGEX",
-    r"https://.*\.netlify\.app",
-)
-
-RATE_LIMIT = int(os.environ.get("RATE_LIMIT", "20"))        # /generate: N so'rov
-RATE_WINDOW = int(os.environ.get("RATE_WINDOW", "60"))       # har RATE_WINDOW soniyada
-MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", str(2 * 1024 * 1024)))  # 2 MB
-MAX_SECONDS_CAP = int(os.environ.get("MAX_SECONDS_CAP", "180"))
-
-# Kirish massivlari uchun chegaralar (haddan tashqari kattasini rad etamiz)
-LIMITS = {
-    "teachers": 2000,
-    "subjects": 500,
-    "classes": 2000,
-    "rooms": 1000,
-    "assignments": 20000,
-    "fixedEntries": 20000,
-}
-
-app = FastAPI(title="Dars jadvali solver", version="2.0")
-
+# Frontend (Netlify) dan chaqirish uchun CORS ochiq
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,      # <-- endi "*" EMAS
-    allow_origin_regex=ALLOWED_ORIGIN_REGEX or None,
-    allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type", "Authorization"],
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
-# ------------------------- Rate limiting -------------------------
-_hits = defaultdict(deque)
-_lock = threading.Lock()
-
-
-def _client_ip(request: Request) -> str:
-    # Render/Netlify proxy ortida haqiqiy IP shu headerda bo'ladi
-    xff = request.headers.get("x-forwarded-for")
-    if xff:
-        return xff.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
-
-
-def _rate_ok(ip: str) -> bool:
-    now = time.time()
-    with _lock:
-        dq = _hits[ip]
-        while dq and now - dq[0] > RATE_WINDOW:
-            dq.popleft()
-        if len(dq) >= RATE_LIMIT:
-            return False
-        dq.append(now)
-        return True
-
-
-@app.middleware("http")
-async def guard(request: Request, call_next):
-    # Katta body'ni rad etamiz (DoS'ga qarshi)
-    if request.method == "POST":
-        cl = request.headers.get("content-length")
-        if cl and cl.isdigit() and int(cl) > MAX_BODY_BYTES:
-            return JSONResponse(status_code=413, content={"error": "So'rov hajmi juda katta"})
-        if request.url.path == "/generate":
-            ip = _client_ip(request)
-            if not _rate_ok(ip):
-                return JSONResponse(
-                    status_code=429,
-                    content={"error": "Juda ko'p so'rov. Bir oz kuting va qayta urining."},
-                )
-    return await call_next(request)
-
-
-# ------------------------- Model / validatsiya -------------------------
 class GenerateRequest(BaseModel):
     school: Dict[str, Any]
     teachers: list
@@ -118,24 +49,12 @@ class GenerateRequest(BaseModel):
     rooms: list = []
     assignments: list
     fixedEntries: list = []
-    # DIQQAT: maxSeconds hech qachon RAD ETILMAYDI. Katta qiymat yuborilsa ham
-    # server uni o'zi chegaraga tushiradi (clamp). Aks holda frontend 422 olib,
-    # zaif "zaxira" generatorga o'tib ketadi va jadval sifati tushadi.
-    maxSeconds: int = Field(default=20)
-
-    @field_validator("teachers", "subjects", "classes", "rooms",
-                     "assignments", "fixedEntries")
-    @classmethod
-    def _cap(cls, v, info):
-        limit = LIMITS.get(info.field_name)
-        if limit is not None and isinstance(v, list) and len(v) > limit:
-            raise ValueError(f"{info.field_name}: juda ko'p element ({len(v)} > {limit})")
-        return v
+    maxSeconds: int = 20
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "ai": bool(os.environ.get("GEMINI_API_KEY"))}
 
 
 @app.post("/generate")
@@ -150,13 +69,115 @@ def generate(req: GenerateRequest):
         "fixedEntries": req.fixedEntries,
     }
     try:
-        secs = max(3, min(MAX_SECONDS_CAP, int(req.maxSeconds)))
-        result = solve_timetable(data, max_seconds=secs)
+        result = solve_timetable(data, max_seconds=max(3, min(90, int(req.maxSeconds))))
         return result
     except Exception as e:
-        # Xizmat hech qachon qulamasin — batafsil ichki xatoni OSHKOR QILMAYMIZ
+        # Xizmat hech qachon qulamasin — xatoni tushunarli qaytaramiz
         return {
             "entries": [], "unfilled": [], "status": "ERROR",
-            "error": "Ichki xatolik yuz berdi. Ma'lumotlarni tekshirib qayta urining.",
-            "stats": {},
+            "error": str(e), "stats": {},
         }
+
+
+# =====================================================================
+#  AI TAHLIL — "Nega joylashmadi?"
+# =====================================================================
+
+MAX_SUMMARY_CHARS = 20000          # cheksiz matn yuborilmasin (xarajat himoyasi)
+GEMINI_URL = ("https://generativelanguage.googleapis.com/v1beta/"
+              "models/{model}:generateContent")
+
+SYSTEM_PROMPT = """Sen O'zbekiston maktablari uchun dars jadvali tizimining yordamchisisan.
+Senga jadval tuzilgandan keyingi CHEKLOVLAR XULOSASI beriladi. Ba'zi darslar
+jadvalga sig'magan. Sening vazifang — SABABINI aniqlab, aniq yechim taklif qilish.
+
+QOIDALAR:
+1. Faqat o'zbek tilida (lotin alifbosida) yoz.
+2. Qisqa yoz: 3-6 ta band, har biri 1-2 gap.
+3. Har bandda AVVAL sabab, KEYIN aniq yechim bo'lsin.
+4. Berilgan raqamlarga tayan. Ma'lumot yetmasa, "ma'lumot yetarli emas" deb yoz —
+   hech qachon raqam o'ylab topma.
+5. O'qituvchi va sinflar #12 kabi raqamlar bilan berilgan — javobda ham
+   AYNAN shu raqamlarni ishlat, ism o'ylab topma.
+6. "ORTIQCHA" deb belgilangan qatorlar eng muhim sabab — ularni birinchi yoz.
+7. Oxirida bitta eng samarali qadamni "Eng tez yechim:" deb ko'rsat.
+8. Markdown sarlavha ishlatma, oddiy matn va "-" belgili ro'yxat yoz."""
+
+_rate = defaultdict(list)          # ip -> [timestamp, ...]
+
+
+def _rate_ok(ip: str) -> bool:
+    limit = int(os.environ.get("AI_RATE_PER_HOUR", "30"))
+    now = time.time()
+    hits = [t for t in _rate[ip] if now - t < 3600]
+    _rate[ip] = hits
+    if len(hits) >= limit:
+        return False
+    hits.append(now)
+    return True
+
+
+class ExplainRequest(BaseModel):
+    summary: str
+    question: str = ""
+
+
+@app.post("/ai/explain")
+def ai_explain(req: ExplainRequest, ):
+    key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not key:
+        return {"ok": False,
+                "error": "AI sozlanmagan: serverda GEMINI_API_KEY muhit o'zgaruvchisi yo'q."}
+
+    summary = (req.summary or "").strip()
+    if len(summary) < 20:
+        return {"ok": False, "error": "Tahlil uchun ma'lumot yetarli emas."}
+    if len(summary) > MAX_SUMMARY_CHARS:
+        summary = summary[:MAX_SUMMARY_CHARS]
+
+    model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip()
+    user_text = summary
+    if req.question:
+        user_text += "\n\nQO'SHIMCHA SAVOL: " + req.question[:500]
+
+    body = {
+        "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "contents": [{"role": "user", "parts": [{"text": user_text}]}],
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 900},
+    }
+    data = json.dumps(body).encode("utf-8")
+    request = urllib.request.Request(
+        GEMINI_URL.format(model=model),
+        data=data,
+        headers={"Content-Type": "application/json", "x-goog-api-key": key},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=45) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = json.loads(e.read().decode("utf-8")).get("error", {}).get("message", "")
+        except Exception:
+            pass
+        if e.code == 404:
+            return {"ok": False,
+                    "error": "Model topilmadi: '%s'. GEMINI_MODEL o'zgaruvchisini "
+                             "to'g'rilang (masalan gemini-2.5-flash)." % model}
+        if e.code in (401, 403):
+            return {"ok": False, "error": "API kalit noto'g'ri yoki muddati tugagan."}
+        if e.code == 429:
+            return {"ok": False, "error": "Kunlik bepul limit tugadi. Ertaga qayta urinib ko'ring."}
+        return {"ok": False, "error": "AI xizmati xatosi (%s). %s" % (e.code, detail[:200])}
+    except Exception as e:
+        return {"ok": False, "error": "AI xizmatiga ulanib bo'lmadi: %s" % str(e)[:200]}
+
+    try:
+        parts = payload["candidates"][0]["content"]["parts"]
+        text = "".join(p.get("text", "") for p in parts).strip()
+    except Exception:
+        text = ""
+    if not text:
+        return {"ok": False, "error": "AI bo'sh javob qaytardi. Qayta urinib ko'ring."}
+    return {"ok": True, "text": text, "model": model}
