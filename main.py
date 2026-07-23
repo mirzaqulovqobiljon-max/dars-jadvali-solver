@@ -161,31 +161,43 @@ def _fetch_models(key: str):
     return out
 
 
-def _pick_model(key: str) -> str:
-    """GEMINI_MODEL berilmagan bo'lsa, mavjudlaridan mosini tanlaydi."""
+def _rank(name: str) -> tuple:
+    """Kichik qiymat = afzalroq. Barqaror va arzon modellar oldinda."""
+    pref = len(MODEL_PREFERENCE)
+    for i, want in enumerate(MODEL_PREFERENCE):
+        if want in name:
+            pref = i
+            break
+    unstable = ("preview" in name) + ("exp" in name)
+    return (pref, unstable, len(name))
+
+
+def _candidates(key: str):
+    """Sinab ko'rish uchun modellar ro'yxati (birinchisi afzal).
+
+    Bitta modelga tayanmaymiz: bepul tarifda ayrim modellarning kunlik
+    kvotasi juda kichik (429), shuning uchun keyingisiga o'tamiz.
+    """
     forced = os.environ.get("GEMINI_MODEL", "").strip()
     if forced:
-        return forced
+        return [forced]
     now = time.time()
     if _model_cache["name"] and now - _model_cache["at"] < 3600:
-        return _model_cache["name"]
-    names = _fetch_models(key)
-    chosen = None
-    for want in MODEL_PREFERENCE:
-        cands = [n for n in names if want in n and "vision" not in n
-                 and "embedding" not in n and "image" not in n]
-        if cands:
-            # eng qisqa nom odatda barqaror (preview/exp suffikssiz) versiya
-            cands.sort(key=lambda x: (("preview" in x) + ("exp" in x), len(x)))
-            chosen = cands[0]
-            break
-    if not chosen and names:
-        chosen = names[0]
-    if not chosen:
+        return list(_model_cache["name"])
+    names = [n for n in _fetch_models(key)
+             if "vision" not in n and "embedding" not in n
+             and "image" not in n and "tts" not in n and "live" not in n]
+    names.sort(key=_rank)
+    names = names[:5]                       # cheksiz urinmaymiz
+    if not names:
         raise RuntimeError("Kalit uchun birorta model mavjud emas")
-    _model_cache["name"] = chosen
+    _model_cache["name"] = names
     _model_cache["at"] = now
-    return chosen
+    return list(names)
+
+
+def _pick_model(key: str) -> str:
+    return _candidates(key)[0]
 
 
 @app.get("/ai/models")
@@ -204,8 +216,12 @@ def ai_models():
         picked = _pick_model(key)
     except Exception as e:
         picked = None
+    try:
+        order = _candidates(key)
+    except Exception:
+        order = []
     return {"ok": True, "count": len(names), "models": names,
-            "selected": picked,
+            "try_order": order, "selected": picked,
             "forced": os.environ.get("GEMINI_MODEL", "").strip() or None}
 
 
@@ -228,11 +244,12 @@ def ai_explain(req: ExplainRequest, ):
         summary = summary[:MAX_SUMMARY_CHARS]
 
     try:
-        model = _pick_model(key)
+        models = _candidates(key)
     except Exception as e:
         return {"ok": False,
                 "error": "Model aniqlanmadi: %s. /ai/models manzilini ochib tekshiring."
                          % str(e)[:150]}
+
     user_text = summary
     if req.question:
         user_text += "\n\nQO'SHIMCHA SAVOL: " + req.question[:500]
@@ -243,40 +260,60 @@ def ai_explain(req: ExplainRequest, ):
         "generationConfig": {"temperature": 0.2, "maxOutputTokens": 900},
     }
     data = json.dumps(body).encode("utf-8")
-    request = urllib.request.Request(
-        GEMINI_URL.format(model=model),
-        data=data,
-        headers={"Content-Type": "application/json", "x-goog-api-key": key},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=45) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        detail = ""
-        try:
-            detail = json.loads(e.read().decode("utf-8")).get("error", {}).get("message", "")
-        except Exception:
-            pass
-        if e.code == 404:
-            _model_cache["name"] = None      # keshni tozalab, keyingi safar qayta qidiramiz
-            return {"ok": False,
-                    "error": "Model topilmadi: '%s'. Render'dagi GEMINI_MODEL "
-                             "o'zgaruvchisini O'CHIRING — tizim mos modelni o'zi "
-                             "tanlaydi. Mavjudlarini ko'rish: /ai/models" % model}
-        if e.code in (401, 403):
-            return {"ok": False, "error": "API kalit noto'g'ri yoki muddati tugagan."}
-        if e.code == 429:
-            return {"ok": False, "error": "Kunlik bepul limit tugadi. Ertaga qayta urinib ko'ring."}
-        return {"ok": False, "error": "AI xizmati xatosi (%s). %s" % (e.code, detail[:200])}
-    except Exception as e:
-        return {"ok": False, "error": "AI xizmatiga ulanib bo'lmadi: %s" % str(e)[:200]}
 
-    try:
-        parts = payload["candidates"][0]["content"]["parts"]
-        text = "".join(p.get("text", "") for p in parts).strip()
-    except Exception:
-        text = ""
-    if not text:
-        return {"ok": False, "error": "AI bo'sh javob qaytardi. Qayta urinib ko'ring."}
-    return {"ok": True, "text": text, "model": model}
+    tried = []
+    last_err = None
+    for model in models:
+        tried.append(model)
+        request = urllib.request.Request(
+            GEMINI_URL.format(model=model),
+            data=data,
+            headers={"Content-Type": "application/json", "x-goog-api-key": key},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=45) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            detail = ""
+            try:
+                detail = json.loads(e.read().decode("utf-8")).get("error", {}).get("message", "")
+            except Exception:
+                pass
+            if e.code in (401, 403):
+                return {"ok": False, "error": "API kalit noto'g'ri yoki muddati tugagan."}
+            if e.code in (404, 429, 503):
+                # Bu model band/mavjud emas — keyingisini sinaymiz
+                _model_cache["at"] = 0       # keshni yangilashga majbur qilamiz
+                last_err = (e.code, detail)
+                continue
+            return {"ok": False,
+                    "error": "AI xizmati xatosi (%s). %s" % (e.code, detail[:200])}
+        except Exception as e:
+            last_err = (0, str(e))
+            continue
+
+        try:
+            parts = payload["candidates"][0]["content"]["parts"]
+            text = "".join(p.get("text", "") for p in parts).strip()
+        except Exception:
+            text = ""
+        if not text:
+            last_err = (0, "bo'sh javob")
+            continue
+        return {"ok": True, "text": text, "model": model}
+
+    # Hamma nomzod ishlamadi
+    code = last_err[0] if last_err else 0
+    if code == 429:
+        return {"ok": False,
+                "error": "Barcha modellarda limit tugadi (%s). Bepul tarifda "
+                         "kunlik/daqiqalik chegara bor — 1-2 daqiqadan keyin yoki "
+                         "ertaga qayta urinib ko'ring." % ", ".join(tried)}
+    if code == 404:
+        return {"ok": False,
+                "error": "Ishlaydigan model topilmadi (%s). /ai/models manzilini "
+                         "ochib ro'yxatni ko'ring." % ", ".join(tried)}
+    return {"ok": False,
+            "error": "AI javob bermadi. Sinalgan modellar: %s. %s"
+                     % (", ".join(tried), (last_err[1][:150] if last_err else ""))}
