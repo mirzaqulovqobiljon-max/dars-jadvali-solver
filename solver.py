@@ -29,6 +29,9 @@ Cheklovlar:
    - bir kunda bir xil fan ko'pi bilan 1 marta (per class)
    - o'qituvchi haftalik maksimal soati
    - BO'SH OYNA YO'Q: har sinf har kunda darslar 0-slotdan ketma-ket (prefix)
+   - IKKI SMENA: har sinfning o'z smenasi bor; o'qituvchi/xona bandligi slot
+     RAQAMI bo'yicha emas, REAL VAQT bo'yicha tekshiriladi (1-smena 1-soati
+     08:00, 2-smena 1-soati 14:00 — kesishmaydi)
   SOFT (optimallashtiriladi):
    - imkon qadar ko'p dars joylashtirilsin (placed maksimal)
    - kunlar muvozanati (bir kun juda ko'p / juda kam bo'lmasin)
@@ -43,6 +46,15 @@ def diagnose(data):
     school = data["school"]
     days = int(school["daysPerWeek"])
     slots = int(school["lessonsPerDay"])
+    # Har sinfning smenasidagi dars soni har xil bo'lishi mumkin
+    _cshift = {c["id"]: int(c.get("shift") or 1) for c in data["classes"]}
+    _sslots = {sh: shift_cfg(school, sh)["lessons"] for sh in (1, 2)}
+
+    def _cls_total_slots(cid):
+        bd = next((c.get("busyDays") or {} for c in data["classes"] if c["id"] == cid), {})
+        ish_kun = days - len([k for k, v in bd.items() if v])
+        return max(1, ish_kun) * _sslots.get(_cshift.get(cid, 1), slots)
+
     total_slots = days * slots
     teachers = {t["id"]: t for t in data["teachers"]}
     msgs = []
@@ -53,6 +65,7 @@ def diagnose(data):
     for a in data["assignments"]:
         cls_load[a["classId"]] = cls_load.get(a["classId"], 0) + int(a.get("hoursPerWeek") or 0)
     for cid, load in cls_load.items():
+        total_slots = _cls_total_slots(cid)     # shu sinfning haqiqiy joy soni
         if load > total_slots:
             msgs.append(
                 f"SINF {cls_names.get(cid, cid)}: {load} soat biriktirilgan, lekin haftada "
@@ -198,10 +211,103 @@ def enumerate_tasks(tasks):
         yield ai, a
 
 
+def _num(v, default):
+    """Bo'sh/None qiymatlar uchun standart qiymat qaytaradi."""
+    if v is None or v == "":
+        return default
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return default
+
+
+def shift_cfg(school, shift):
+    """Smena sozlamalari — frontend'dagi shiftCfg() bilan AYNAN bir xil.
+    2-smenaning o'z boshlanish vaqti, dars soni va davomiyligi bo'lishi mumkin."""
+    if int(shift or 1) == 2:
+        return {
+            "start": school.get("startShift2") or "14:00",
+            "lessons": _num(school.get("lessonsPerDay2"), _num(school.get("lessonsPerDay"), 6)),
+            "dur": _num(school.get("lessonDuration2"), _num(school.get("lessonDuration"), 45)),
+            "brk": _num(school.get("breakDuration2"), _num(school.get("breakDuration"), 10)),
+            "big_after": _num(school.get("bigBreakAfter2"), _num(school.get("bigBreakAfter"), 0)),
+            "big_dur": _num(school.get("bigBreakDuration2"), _num(school.get("bigBreakDuration"), 0)),
+        }
+    return {
+        "start": school.get("startShift1") or "08:00",
+        "lessons": _num(school.get("lessonsPerDay"), 6),
+        "dur": _num(school.get("lessonDuration"), 45),
+        "brk": _num(school.get("breakDuration"), 10),
+        "big_after": _num(school.get("bigBreakAfter"), 0),
+        "big_dur": _num(school.get("bigBreakDuration"), 0),
+    }
+
+
+def _hhmm(t):
+    try:
+        parts = str(t or "0:0").split(":")
+        return int(parts[0] or 0) * 60 + int(parts[1] or 0)
+    except (ValueError, IndexError):
+        return 0
+
+
+def lesson_span(school, shift, i):
+    """i-darsning (boshlanish, tugash) daqiqasi — kun boshidan hisoblab."""
+    c = shift_cfg(school, shift)
+    t = _hhmm(c["start"])
+    for k in range(i):
+        t += c["dur"] + c["brk"]
+        if c["big_after"] and k + 1 == c["big_after"]:
+            t += (c["big_dur"] - c["brk"])
+    return (t, t + c["dur"])
+
+
+def slots_overlap(school, sh1, i1, sh2, i2):
+    """Ikki (smena, soat) REAL VAQT bo'yicha kesishadimi.
+    1-smena 1-soati (08:00) va 2-smena 1-soati (14:00) — kesishmaydi,
+    shuning uchun bitta o'qituvchi ikkalasida ham dars bera oladi."""
+    a = lesson_span(school, sh1, i1)
+    b = lesson_span(school, sh2, i2)
+    return a[0] < b[1] and b[0] < a[1]
+
+
 def solve_timetable(data, max_seconds=20):
     school = data["school"]
     days = int(school["daysPerWeek"])
     slots = int(school["lessonsPerDay"])
+    # ===== SMENALAR =====
+    # Har sinfning o'z smenasi bor; smenalar dars soni va vaqti bilan farq qiladi.
+    class_shift = {c["id"]: int(c.get("shift") or 1) for c in data["classes"]}
+    shift_slots = {sh: shift_cfg(school, sh)["lessons"] for sh in (1, 2)}
+    # Modelning umumiy slot diapazoni — ikki smenadagi eng kattasi
+    slots = max(slots, shift_slots.get(1, slots), shift_slots.get(2, 0))
+
+    def cls_slots(cid):
+        """Shu sinfda kuniga nechta dars soati bor."""
+        return shift_slots.get(class_shift.get(cid, 1), slots)
+
+    # Vaqt jihatdan kesishuvchi (smena, soat) juftliklari — oldindan hisoblanadi
+    _ov_cache = {}
+
+    def time_conflict(cid1, s1, cid2, s2):
+        sh1, sh2 = class_shift.get(cid1, 1), class_shift.get(cid2, 1)
+        if sh1 == sh2:
+            return s1 == s2
+        key = (sh1, s1, sh2, s2)
+        if key not in _ov_cache:
+            _ov_cache[key] = slots_overlap(school, sh1, s1, sh2, s2)
+        return _ov_cache[key]
+
+    # O'qituvchi bandligini VAQT bo'yicha guruhlash uchun: (smena,soat) -> vaqt oynasi kaliti
+    def time_cells(cid, s):
+        """Shu (sinf, soat) qaysi vaqt oynalarini egallaydi — ikkala smena bo'yicha."""
+        sh = class_shift.get(cid, 1)
+        cells = [(sh, s)]
+        other = 2 if sh == 1 else 1
+        for j in range(shift_slots.get(other, 0)):
+            if slots_overlap(school, sh, s, other, j):
+                cells.append((other, j))
+        return cells
     teachers = {t["id"]: t for t in data["teachers"]}
     subjects = {s["id"]: s for s in data["subjects"]}
     classes = data["classes"]
@@ -229,10 +335,16 @@ def solve_timetable(data, max_seconds=20):
     # qulflangan darslar egallagan (o'qituvchi/xona) slotlar — bandlik
     fixed_teacher = set()
     fixed_room = set()
+    fixed_teacher_cell = set()   # (tid, day, (smena,soat)) — vaqt oynasi bo'yicha
+    fixed_room_cell = set()
     for e in fixed_entries:
         fixed_teacher.add((e["teacherId"], e["day"], e["lesson"]))
         if e.get("roomId"):
             fixed_room.add((e["roomId"], e["day"], e["lesson"]))
+        for cell in time_cells(e["classId"], e["lesson"]):
+            fixed_teacher_cell.add((e["teacherId"], e["day"], cell))
+            if e.get("roomId"):
+                fixed_room_cell.add((e["roomId"], e["day"], cell))
 
     def teacher_ok(tid, d, s):
         """o'qituvchi (tid) d-kun s-soatda ishlay oladimi (metodik/bandlik)."""
@@ -267,15 +379,22 @@ def solve_timetable(data, max_seconds=20):
                 if ok and a.get("isSplit") and a.get("splitTeacherId"):
                     if not teacher_ok(a["splitTeacherId"], d, s):
                         ok = False
-                # qulflangan darslar bilan to'qnashuv bo'lmasin
-                if ok and (a["teacherId"], d, s) in fixed_teacher:
-                    ok = False
-                if ok and a.get("isSplit") and a.get("splitTeacherId") and (a["splitTeacherId"], d, s) in fixed_teacher:
-                    ok = False
-                if ok and a.get("roomId") and (a["roomId"], d, s) in fixed_room:
-                    ok = False
+                # qulflangan darslar bilan to'qnashuv bo'lmasin (REAL VAQT bo'yicha)
+                if ok:
+                    cells = set(time_cells(a["classId"], s))
+                    if any((a["teacherId"], d, cell) in fixed_teacher_cell for cell in cells):
+                        ok = False
+                    if ok and a.get("isSplit") and a.get("splitTeacherId"):
+                        if any((a["splitTeacherId"], d, cell) in fixed_teacher_cell for cell in cells):
+                            ok = False
+                    if ok and a.get("roomId"):
+                        if any((a["roomId"], d, cell) in fixed_room_cell for cell in cells):
+                            ok = False
                 # sinfning band kuni — dars qo'yilmaydi
                 if ok and d in class_busy.get(a["classId"], set()):
+                    ok = False
+                # SMENA: bu sinfda bunday soat umuman yo'q (masalan 2-smenada 5 soat)
+                if ok and s >= cls_slots(a["classId"]):
                     ok = False
                 if ok:
                     x[(ai, d, s)] = m.NewBoolVar(f"x_{ai}_{d}_{s}")
@@ -314,9 +433,13 @@ def solve_timetable(data, max_seconds=20):
     # Agar (d, s+1) band bo'lsa, (d, s) ham band bo'lishi shart -> darslar 1-soatdan
     # ketma-ket, bo'sh joy faqat kun oxirida.
     for c in class_ids:
+        n_slots = cls_slots(c)          # shu sinf smenasidagi dars soni
         for d in D:
-            for s in range(slots - 1):
+            for s in range(n_slots - 1):
                 m.Add(y[(c, d, s)] >= y[(c, d, s + 1)])
+            # smenada mavjud bo'lmagan soatlar umuman band bo'lmasin
+            for s in range(n_slots, slots):
+                m.Add(y[(c, d, s)] == 0)
 
     # ===== QAT'IY: har kun 0 YOKI kamida MIN_PER_DAY soat + tekis taqsimot =====
     # DIQQAT: sinfning BAND KUNLARINI (busyDays) hisobga olamiz — ish kunlari kamayadi.
@@ -336,7 +459,7 @@ def solve_timetable(data, max_seconds=20):
         # yuqori chegara — darslarni ish kunlariga TEKIS yoyish uchun uni imkon
         # qadar past tutamiz (+1 yo'q). Bu bir kunga siqib, boshqa kunni bo'sh
         # qoldirishning oldini oladi.
-        hi_day = min(slots, max(min_day, math.ceil(total_c / work_days)))
+        hi_day = min(cls_slots(c), max(min_day, math.ceil(total_c / work_days)))
         # Agar darslar soni ish kunlariga yetsa (har kunga kamida 1 tadan), HAR ish
         # kunida kamida 1 dars bo'lishini QAT'IY talab qilamiz -> bir kun butunlay
         # bo'sh qolmaydi (masalan Dushanba bo'sh qolmaydi).
@@ -362,31 +485,40 @@ def solve_timetable(data, max_seconds=20):
                 m.Add(day_load >= min_day).OnlyEnforceIf(has_day)
                 m.Add(day_load <= hi_day)
 
-    # O'qituvchi bir vaqtda bitta dars (parallel yo'q) — split teacher ham
-    teacher_slot = {}  # (tid,d,s) -> list of vars
+    # ===== O'QITUVCHI BIR VAQTDA BITTA DARS =====
+    # DIQQAT: bandlik slot RAQAMI bo'yicha emas, REAL VAQT bo'yicha tekshiriladi.
+    # 1-smena 1-soati (08:00) va 2-smena 1-soati (14:00) — har xil vaqt, ya'ni
+    # bitta o'qituvchi ikkalasida ham dars bera oladi. Aksincha, 1-smenaning
+    # oxirgi soati 2-smenaning birinchi soati bilan ustma-ust tushishi mumkin —
+    # bunda to'qnashuv bo'ladi.
+    teacher_slot = {}  # (tid, d, (smena,soat)) -> vars
     for ai, a in enumerate(assignments):
         for d in D:
             for s in S:
                 if (ai, d, s) not in x:
                     continue
-                teacher_slot.setdefault((a["teacherId"], d, s), []).append(x[(ai, d, s)])
-                if a.get("isSplit") and a.get("splitTeacherId"):
-                    teacher_slot.setdefault((a["splitTeacherId"], d, s), []).append(x[(ai, d, s)])
+                cells = time_cells(a["classId"], s)
+                for cell in cells:
+                    teacher_slot.setdefault((a["teacherId"], d, cell), []).append(x[(ai, d, s)])
+                    if a.get("isSplit") and a.get("splitTeacherId"):
+                        teacher_slot.setdefault((a["splitTeacherId"], d, cell), []).append(x[(ai, d, s)])
     for key, lst in teacher_slot.items():
         if len(lst) > 1:
             m.Add(sum(lst) <= 1)
 
-    # Xona bir vaqtda bitta dars (asosiy va split xona)
+    # ===== XONA BIR VAQTDA BITTA DARS ===== (u ham real vaqt bo'yicha)
     room_slot = {}
     for ai, a in enumerate(assignments):
         for d in D:
             for s in S:
                 if (ai, d, s) not in x:
                     continue
-                if a.get("roomId"):
-                    room_slot.setdefault((a["roomId"], d, s), []).append(x[(ai, d, s)])
-                if a.get("isSplit") and a.get("splitRoomId"):
-                    room_slot.setdefault((a["splitRoomId"], d, s), []).append(x[(ai, d, s)])
+                cells = time_cells(a["classId"], s)
+                for cell in cells:
+                    if a.get("roomId"):
+                        room_slot.setdefault((a["roomId"], d, cell), []).append(x[(ai, d, s)])
+                    if a.get("isSplit") and a.get("splitRoomId"):
+                        room_slot.setdefault((a["splitRoomId"], d, cell), []).append(x[(ai, d, s)])
     for key, lst in room_slot.items():
         if len(lst) > 1:
             m.Add(sum(lst) <= 1)
@@ -684,13 +816,40 @@ def solve_timetable(data, max_seconds=20):
 
 def _compact(entries, data, days, slots, teachers, subjects):
     """Darslarni oldinga suradi (cheklovlarni buzmasdan). Split (guruhli) darslar
-    juft yozuv (A/B) bo'lgani uchun ular YAXLIT hujayra sifatida birga ko'chadi."""
+    juft yozuv (A/B) bo'lgani uchun ular YAXLIT hujayra sifatida birga ko'chadi.
+
+    IKKI SMENA: bandlik slot raqami emas, REAL VAQT bo'yicha hisoblanadi.
+    Aks holda 1-smenaning oxirgi soati bilan 2-smenaning birinchi soati
+    ustma-ust tushganda o'qituvchi uchun to'qnashuv hosil bo'lishi mumkin edi."""
+    school = data["school"]
+    class_shift = {c["id"]: int(c.get("shift") or 1) for c in data["classes"]}
+    shift_slots = {sh: shift_cfg(school, sh)["lessons"] for sh in (1, 2)}
+    _cells_cache = {}
+
+    def time_cells(cid, s):
+        """Shu (sinf, soat) egallaydigan vaqt oynalari — ikkala smena bo'yicha."""
+        sh = class_shift.get(cid, 1)
+        key = (sh, s)
+        if key in _cells_cache:
+            return _cells_cache[key]
+        cells = [(sh, s)]
+        other = 2 if sh == 1 else 1
+        for j in range(shift_slots.get(other, 0)):
+            if slots_overlap(school, sh, s, other, j):
+                cells.append((other, j))
+        _cells_cache[key] = cells
+        return cells
+
+    def cls_slots(cid):
+        return shift_slots.get(class_shift.get(cid, 1), slots)
+
     teacher_busy = set()
     room_busy = set()
     for e in entries:
-        teacher_busy.add((e["teacherId"], e["day"], e["lesson"]))
-        if e.get("roomId"):
-            room_busy.add((e["roomId"], e["day"], e["lesson"]))
+        for cell in time_cells(e["classId"], e["lesson"]):
+            teacher_busy.add((e["teacherId"], e["day"], cell))
+            if e.get("roomId"):
+                room_busy.add((e["roomId"], e["day"], cell))
 
     def teacher_ok(tid, d, s):
         t = teachers.get(tid)
@@ -716,10 +875,13 @@ def _compact(entries, data, days, slots, teachers, subjects):
 
     def can_place_cell(cell, d, s):
         for e in cell:
-            if (e["teacherId"], d, s) in teacher_busy:
+            if s >= cls_slots(e["classId"]):        # bu smenada bunday soat yo'q
                 return False
-            if e.get("roomId") and (e["roomId"], d, s) in room_busy:
-                return False
+            for c2 in time_cells(e["classId"], s):
+                if (e["teacherId"], d, c2) in teacher_busy:
+                    return False
+                if e.get("roomId") and (e["roomId"], d, c2) in room_busy:
+                    return False
             if not teacher_ok(e["teacherId"], d, s):
                 return False
             if not subject_ok(e["subjectId"], d, s):
@@ -728,15 +890,17 @@ def _compact(entries, data, days, slots, teachers, subjects):
 
     def move_cell(cell, nd, ns):
         for e in cell:
-            teacher_busy.discard((e["teacherId"], e["day"], e["lesson"]))
-            if e.get("roomId"):
-                room_busy.discard((e["roomId"], e["day"], e["lesson"]))
+            for c2 in time_cells(e["classId"], e["lesson"]):
+                teacher_busy.discard((e["teacherId"], e["day"], c2))
+                if e.get("roomId"):
+                    room_busy.discard((e["roomId"], e["day"], c2))
         for e in cell:
             e["day"] = nd
             e["lesson"] = ns
-            teacher_busy.add((e["teacherId"], nd, ns))
-            if e.get("roomId"):
-                room_busy.add((e["roomId"], nd, ns))
+            for c2 in time_cells(e["classId"], ns):
+                teacher_busy.add((e["teacherId"], nd, c2))
+                if e.get("roomId"):
+                    room_busy.add((e["roomId"], nd, c2))
 
     class_ids = sorted(set(e["classId"] for e in entries))
 
@@ -762,14 +926,20 @@ def _compact(entries, data, days, slots, teachers, subjects):
                     cell = occ[nxt]
                     # o'z joyidan bo'shatib tekshiramiz (o'zi bilan to'qnashmasin)
                     for e in cell:
-                        teacher_busy.discard((e["teacherId"], d, nxt))
-                        if e.get("roomId"):
-                            room_busy.discard((e["roomId"], d, nxt))
+                        for c2 in time_cells(e["classId"], nxt):
+                            for _c in time_cells(e["classId"], c2):
+                                teacher_busy.discard((e["teacherId"], d, _c))
+                            if e.get("roomId"):
+                                for _c in time_cells(e["classId"], c2):
+                                    room_busy.discard((e["roomId"], d, _c))
                     ok = can_place_cell(cell, d, target)
                     for e in cell:
-                        teacher_busy.add((e["teacherId"], d, nxt))
-                        if e.get("roomId"):
-                            room_busy.add((e["roomId"], d, nxt))
+                        for c2 in time_cells(e["classId"], nxt):
+                            for _c in time_cells(e["classId"], c2):
+                                teacher_busy.add((e["teacherId"], d, _c))
+                            if e.get("roomId"):
+                                for _c in time_cells(e["classId"], c2):
+                                    room_busy.add((e["roomId"], d, _c))
                     if ok:
                         move_cell(cell, d, target)
                         occ = cells_of(cid, d)
@@ -810,24 +980,30 @@ def _compact(entries, data, days, slots, teachers, subjects):
                     if any(e["subjectId"] in subj_today for e in cell):
                         continue
                     for e in cell:
-                        teacher_busy.discard((e["teacherId"], od, o_last))
+                        for _c in time_cells(e["classId"], o_last):
+                            teacher_busy.discard((e["teacherId"], od, _c))
                         if e.get("roomId"):
-                            room_busy.discard((e["roomId"], od, o_last))
+                            for _c in time_cells(e["classId"], o_last):
+                                room_busy.discard((e["roomId"], od, _c))
                     ok = can_place_cell(cell, d, gap_slot)
                     if ok:
                         for e in cell:
                             e["day"] = d
                             e["lesson"] = gap_slot
-                            teacher_busy.add((e["teacherId"], d, gap_slot))
+                            for _c in time_cells(e["classId"], gap_slot):
+                                teacher_busy.add((e["teacherId"], d, _c))
                             if e.get("roomId"):
-                                room_busy.add((e["roomId"], d, gap_slot))
+                                for _c in time_cells(e["classId"], gap_slot):
+                                    room_busy.add((e["roomId"], d, _c))
                         moved = True
                         changed = True
                     else:
                         for e in cell:
-                            teacher_busy.add((e["teacherId"], od, o_last))
+                            for _c in time_cells(e["classId"], o_last):
+                                teacher_busy.add((e["teacherId"], od, _c))
                             if e.get("roomId"):
-                                room_busy.add((e["roomId"], od, o_last))
+                                for _c in time_cells(e["classId"], o_last):
+                                    room_busy.add((e["roomId"], od, _c))
 
     # 3-BOSQICH: agressiv oyna to'ldirish — bo'sh oynaga boshqa kundagi ISTALGAN
     # darsni (nafaqat oxirgisini) ko'chiramiz, agar u dars o'z kunida oxirgi bo'lsa
@@ -870,24 +1046,30 @@ def _compact(entries, data, days, slots, teachers, subjects):
                         if any(e["subjectId"] in subj_today for e in cell):
                             continue
                         for e in cell:
-                            teacher_busy.discard((e["teacherId"], od, oslot))
+                            for _c in time_cells(e["classId"], oslot):
+                                teacher_busy.discard((e["teacherId"], od, _c))
                             if e.get("roomId"):
-                                room_busy.discard((e["roomId"], od, oslot))
+                                for _c in time_cells(e["classId"], oslot):
+                                    room_busy.discard((e["roomId"], od, _c))
                         ok = can_place_cell(cell, d, gap_slot)
                         if ok:
                             for e in cell:
                                 e["day"] = d
                                 e["lesson"] = gap_slot
-                                teacher_busy.add((e["teacherId"], d, gap_slot))
+                                for _c in time_cells(e["classId"], gap_slot):
+                                    teacher_busy.add((e["teacherId"], d, _c))
                                 if e.get("roomId"):
-                                    room_busy.add((e["roomId"], d, gap_slot))
+                                    for _c in time_cells(e["classId"], gap_slot):
+                                        room_busy.add((e["roomId"], d, _c))
                             moved = True
                             changed = True
                         else:
                             for e in cell:
-                                teacher_busy.add((e["teacherId"], od, oslot))
+                                for _c in time_cells(e["classId"], oslot):
+                                    teacher_busy.add((e["teacherId"], od, _c))
                                 if e.get("roomId"):
-                                    room_busy.add((e["roomId"], od, oslot))
+                                    for _c in time_cells(e["classId"], oslot):
+                                        room_busy.add((e["roomId"], od, _c))
                 # oslotdan bo'shagan joyni to'ldirish keyingi 1-bosqich takrorida hal bo'ladi
 
     # 4-BOSQICH: qolgan oynalarni yana bir marta kun ichida zichlash
@@ -911,14 +1093,20 @@ def _compact(entries, data, days, slots, teachers, subjects):
                         break
                     cell = occ[nxt]
                     for e in cell:
-                        teacher_busy.discard((e["teacherId"], d, nxt))
-                        if e.get("roomId"):
-                            room_busy.discard((e["roomId"], d, nxt))
+                        for c2 in time_cells(e["classId"], nxt):
+                            for _c in time_cells(e["classId"], c2):
+                                teacher_busy.discard((e["teacherId"], d, _c))
+                            if e.get("roomId"):
+                                for _c in time_cells(e["classId"], c2):
+                                    room_busy.discard((e["roomId"], d, _c))
                     ok = can_place_cell(cell, d, target)
                     for e in cell:
-                        teacher_busy.add((e["teacherId"], d, nxt))
-                        if e.get("roomId"):
-                            room_busy.add((e["roomId"], d, nxt))
+                        for c2 in time_cells(e["classId"], nxt):
+                            for _c in time_cells(e["classId"], c2):
+                                teacher_busy.add((e["teacherId"], d, _c))
+                            if e.get("roomId"):
+                                for _c in time_cells(e["classId"], c2):
+                                    room_busy.add((e["roomId"], d, _c))
                     if ok:
                         move_cell(cell, d, target)
                         occ = cells_of(cid, d)
