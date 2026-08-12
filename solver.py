@@ -17,6 +17,8 @@ Chiqish (JSON dict):
   "entries":[{"classId","subjectId","teacherId","roomId","day","lesson","group"(null|"A"|"B")}],
   "unfilled":[{"classId","subjectId","teacherId","hours"}],
   "status": "OPTIMAL"|"FEASIBLE"|"INFEASIBLE",
+  "relaxed": 0|1|2,        # qaysi bosqichda yechim topildi (0 = to'liq model)
+  "warnings": ["..."],     # yumshatilgan cheklovlar haqida ogohlantirish
   "stats": {...}
 }
 
@@ -26,7 +28,8 @@ Cheklovlar:
    - o'qituvchi bir vaqtda bitta dars (parallel yo'q), split ikkinchi o'qituvchi ham
    - metodik kun / o'qituvchi bandligi / fan kun-soat cheklovi
    - xona bir vaqtda bitta dars
-   - bir kunda bir xil fan ko'pi bilan 1 marta (per class)
+   - bir kunda bir xil fan ko'pi bilan 1 marta (per class; agar fanning haftalik
+     soati kunlar sonidan ko'p bo'lsa — 2 marta)
    - o'qituvchi haftalik maksimal soati
    - BO'SH OYNA YO'Q: har sinf har kunda darslar 0-slotdan ketma-ket (prefix)
    - IKKI SMENA: har sinfning o'z smenasi bor; o'qituvchi/xona bandligi slot
@@ -271,7 +274,9 @@ def slots_overlap(school, sh1, i1, sh2, i2):
     return a[0] < b[1] and b[0] < a[1]
 
 
-def solve_timetable(data, max_seconds=20):
+def solve_timetable(data, max_seconds=20, relax_days=False):
+    """relax_days=True bo'lsa kunlik minimum cheklovlari butunlay olib
+    tashlanadi. INFEASIBLE holatida solve_safe() shu rejimda qayta uradi."""
     school = data["school"]
     days = int(school["daysPerWeek"])
     slots = int(school["lessonsPerDay"])
@@ -459,7 +464,10 @@ def solve_timetable(data, max_seconds=20):
         # yuqori chegara — darslarni ish kunlariga TEKIS yoyish uchun uni imkon
         # qadar past tutamiz (+1 yo'q). Bu bir kunga siqib, boshqa kunni bo'sh
         # qoldirishning oldini oladi.
-        hi_day = min(cls_slots(c), max(min_day, math.ceil(total_c / work_days)))
+        # TUZATILDI (2026-08): yuqori chegara juda tor edi -> +1 zaxira.
+        # Zaxirasiz model ko'p hollarda INFEASIBLE bo'lardi; tekis taqsimot
+        # baribir W_IMBAL yumshoq jarimasi bilan ta'minlanadi.
+        hi_day = min(cls_slots(c), max(min_day, math.ceil(total_c / work_days) + 1))
         # Agar darslar soni ish kunlariga yetsa (har kunga kamida 1 tadan), HAR ish
         # kunida kamida 1 dars bo'lishini QAT'IY talab qilamiz -> bir kun butunlay
         # bo'sh qolmaydi (masalan Dushanba bo'sh qolmaydi).
@@ -473,16 +481,23 @@ def solve_timetable(data, max_seconds=20):
             if d in busy:
                 continue  # band kun — cheklov qo'ymaymiz (x allaqachon yo'q)
             day_load = sum(y[(c, d, s)] for s in S)
-            if force_all_days:
-                # har ish kunida kamida forced_min dars (qat'iy) -> bo'sh kun yo'q
-                m.Add(day_load >= forced_min)
+            if force_all_days and not relax_days:
+                # TUZATILDI (2026-08): ilgari bu yerda `day_load >= forced_min`
+                # QAT'IY cheklov bor edi. Agar sinfning biror kunini to'ldirish
+                # imkonsiz bo'lsa (o'qituvchilarning metodik kunlari ustma-ust
+                # tushganda), butun model INFEASIBLE bo'lib, sayt BO'SH jadval
+                # olardi. Bo'sh kunga qarshi rag'bat W_EMPTYDAY yumshoq
+                # jarimasida saqlanadi -> natija sifati tushmaydi.
+                m.Add(day_load <= hi_day)
+            elif force_all_days:
                 m.Add(day_load <= hi_day)
             else:
                 # kam darsli sinf: kun bo'sh bo'lishi mumkin, lekin dars bo'lsa >=min_day
                 has_day = m.NewBoolVar(f"hasday_{c}_{d}")
                 m.Add(day_load >= 1).OnlyEnforceIf(has_day)
                 m.Add(day_load == 0).OnlyEnforceIf(has_day.Not())
-                m.Add(day_load >= min_day).OnlyEnforceIf(has_day)
+                if not relax_days:
+                    m.Add(day_load >= min_day).OnlyEnforceIf(has_day)
                 m.Add(day_load <= hi_day)
 
     # ===== O'QITUVCHI BIR VAQTDA BITTA DARS =====
@@ -814,6 +829,56 @@ def solve_timetable(data, max_seconds=20):
     }
 
 
+
+def solve_safe(data, max_seconds=20):
+    """XAVFSIZ KIRISH NUQTASI — API shuni chaqirishi kerak.
+
+    Muammo: solve_timetable() INFEASIBLE qaytarsa entries BO'SH bo'ladi va
+    foydalanuvchi hech narsa olmaydi ("Bu shartlar bilan jadval tuzib bo'lmadi").
+    Aslida cheklovlarning kichik qismi aybdor bo'ladi, qolgan darslarni
+    joylashtirish mumkin.
+
+    Yechim — bosqichma-bosqich yumshatish:
+      1) To'liq model
+      2) Kunlik minimum cheklovlarisiz (relax_days)
+      3) maxHours cheklovisiz (oxirgi chora, natijada ogohlantirish qaytadi)
+    Birinchi muvaffaqiyatli bosqich qaytariladi.
+    """
+    warnings = []
+
+    # 1-bosqich: to'liq model
+    res = solve_timetable(data, max_seconds=max_seconds)
+    if (res.get("entries") or []) and res.get("status") not in ("INFEASIBLE", "MODEL_INVALID"):
+        res["relaxed"] = 0
+        res["warnings"] = warnings
+        return res
+
+    # 2-bosqich: kunlik minimum cheklovlarini yumshatamiz
+    warnings.append("Kunlik minimal dars soni cheklovi yumshatildi — "
+                    "ba'zi kunlarda darslar soni kam bo'lishi mumkin.")
+    res = solve_timetable(data, max_seconds=max_seconds, relax_days=True)
+    if (res.get("entries") or []) and res.get("status") not in ("INFEASIBLE", "MODEL_INVALID"):
+        res["relaxed"] = 1
+        res["warnings"] = warnings
+        return res
+
+    # 3-bosqich: o'qituvchi haftalik limitini vaqtincha olib tashlaymiz
+    warnings.append("O'qituvchilarning haftalik maksimal soati cheklovi olib tashlandi — "
+                    "yuklamani qo'lda tekshiring.")
+    import copy
+    d2 = copy.deepcopy(data)
+    for t in d2.get("teachers", []):
+        t["maxHours"] = None
+    res = solve_timetable(d2, max_seconds=max_seconds, relax_days=True)
+    res["relaxed"] = 2
+    res["warnings"] = warnings
+    if not (res.get("entries") or []):
+        res["warnings"].append(
+            "Jadval tuzilmadi. Sabab odatda ma'lumotda: sinf haftalik soati kunlik "
+            "sig'imdan ortiq, yoki o'qituvchilarda metodik kun/band soatlar juda ko'p.")
+    return res
+
+
 def _compact(entries, data, days, slots, teachers, subjects):
     """Darslarni oldinga suradi (cheklovlarni buzmasdan). Split (guruhli) darslar
     juft yozuv (A/B) bo'lgani uchun ular YAXLIT hujayra sifatida birga ko'chadi.
@@ -1118,4 +1183,6 @@ def _compact(entries, data, days, slots, teachers, subjects):
 if __name__ == "__main__":
     import json, sys
     data = json.load(sys.stdin)
-    print(json.dumps(solve_timetable(data)))
+    # MUHIM: solve_timetable emas, solve_safe chaqiriladi — INFEASIBLE holatida
+    # bo'sh jadval o'rniga yumshatilgan yechim qaytadi.
+    print(json.dumps(solve_safe(data)))
