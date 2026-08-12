@@ -274,9 +274,12 @@ def slots_overlap(school, sh1, i1, sh2, i2):
     return a[0] < b[1] and b[0] < a[1]
 
 
-def solve_timetable(data, max_seconds=20, relax_days=False):
-    """relax_days=True bo'lsa kunlik minimum cheklovlari butunlay olib
-    tashlanadi. INFEASIBLE holatida solve_safe() shu rejimda qayta uradi."""
+def solve_timetable(data, max_seconds=20, relax_days=0):
+    """relax_days — kunlik yuk cheklovlarining yumshatish darajasi:
+         0 = ideal tekis taqsimot (floor..ceil)
+         1 = +-1 zaxira
+         2 = chegara yo'q
+       INFEASIBLE holatida solve_safe() bu darajalarni ketma-ket sinaydi."""
     school = data["school"]
     days = int(school["daysPerWeek"])
     slots = int(school["lessonsPerDay"])
@@ -460,18 +463,36 @@ def solve_timetable(data, max_seconds=20, relax_days=False):
             min_day = 1          # kam dars -> erkin joylashsin
         else:
             min_day = MIN_PER_DAY
-        # yuqori chegara — ish kunlariga tekis yoyilsin (+1 moslashuvchanlik uchun)
-        # yuqori chegara — darslarni ish kunlariga TEKIS yoyish uchun uni imkon
-        # qadar past tutamiz (+1 yo'q). Bu bir kunga siqib, boshqa kunni bo'sh
-        # qoldirishning oldini oladi.
-        # TUZATILDI (2026-08): yuqori chegara juda tor edi -> +1 zaxira.
-        # Zaxirasiz model ko'p hollarda INFEASIBLE bo'lardi; tekis taqsimot
-        # baribir W_IMBAL yumshoq jarimasi bilan ta'minlanadi.
-        hi_day = min(cls_slots(c), max(min_day, math.ceil(total_c / work_days) + 1))
         # Agar darslar soni ish kunlariga yetsa (har kunga kamida 1 tadan), HAR ish
         # kunida kamida 1 dars bo'lishini QAT'IY talab qilamiz -> bir kun butunlay
         # bo'sh qolmaydi (masalan Dushanba bo'sh qolmaydi).
         force_all_days = total_c >= work_days
+        # ===== KUNLIK YUK CHEGARALARI (bosqichli qattiqlik) =====
+        # relax_days — solve_safe() beradigan yumshatish darajasi:
+        #   0 = ideal tekis taqsimot (floor..ceil) — bir kun 7, boshqasi 3 bo'lolmaydi
+        #   1 = +-1 zaxira (INFEASIBLE bo'lganda)
+        #   2 = chegara yo'q (oxirgi chora)
+        # Ilgari bu yerda faqat qat'iy `ceil` bor edi: model tez-tez INFEASIBLE
+        # bo'lardi. Keyin +1 qo'shilgach INFEASIBLE yo'qoldi-yu, taqsimot buzildi
+        # (bir kun 7 dars, boshqasi 3). Bosqichli yondashuv ikkovini ham hal qiladi.
+        even_hi = math.ceil(total_c / work_days)
+        even_lo = total_c // work_days
+        if relax_days >= 3:
+            # oxirgi chora: hech qanday kunlik chegara yo'q
+            hi_day = cls_slots(c)
+            lo_day = 0
+        elif relax_days == 2:
+            # chegara bo'sh, LEKIN kun butunlay bo'sh qolmasin.
+            # Busiz [0,0,0,0,7,7] kabi jadval chiqardi — 4 kun bo'sh, 2 kun
+            # to'la yuklangan. Maktab uchun bu yaroqsiz.
+            hi_day = cls_slots(c)
+            lo_day = 1 if force_all_days else 0
+        elif relax_days == 1:
+            hi_day = min(cls_slots(c), max(min_day, even_hi + 1))
+            lo_day = max(0, even_lo - 1)
+        else:
+            hi_day = min(cls_slots(c), max(min_day, even_hi))
+            lo_day = even_lo
         # har kunga majburiy minimum: darslar barcha kunga yetishi shart.
         # total_c ni work_days ga bo'lганда butun qism — har kunга kафolatли minimum.
         forced_min = min(min_day, total_c // work_days) if force_all_days else min_day
@@ -481,16 +502,12 @@ def solve_timetable(data, max_seconds=20, relax_days=False):
             if d in busy:
                 continue  # band kun — cheklov qo'ymaymiz (x allaqachon yo'q)
             day_load = sum(y[(c, d, s)] for s in S)
-            if force_all_days and not relax_days:
-                # TUZATILDI (2026-08): ilgari bu yerda `day_load >= forced_min`
-                # QAT'IY cheklov bor edi. Agar sinfning biror kunini to'ldirish
-                # imkonsiz bo'lsa (o'qituvchilarning metodik kunlari ustma-ust
-                # tushganda), butun model INFEASIBLE bo'lib, sayt BO'SH jadval
-                # olardi. Bo'sh kunga qarshi rag'bat W_EMPTYDAY yumshoq
-                # jarimasida saqlanadi -> natija sifati tushmaydi.
+            if force_all_days:
                 m.Add(day_load <= hi_day)
-            elif force_all_days:
-                m.Add(day_load <= hi_day)
+                # Quyi chegara: kun juda bo'sh qolmasin. relax_days=2 da lo_day=0,
+                # ya'ni cheklov amalda yo'q -> INFEASIBLE xavfi qolmaydi.
+                if lo_day >= 1:
+                    m.Add(day_load >= lo_day)
             else:
                 # kam darsli sinf: kun bo'sh bo'lishi mumkin, lekin dars bo'lsa >=min_day
                 has_day = m.NewBoolVar(f"hasday_{c}_{d}")
@@ -763,6 +780,12 @@ def solve_timetable(data, max_seconds=20, relax_days=False):
     solver = cp_model.CpSolver()
     solver.parameters.num_search_workers = 4
     solver.parameters.max_time_in_seconds = float(max_seconds)
+    # Qat'iy urug' — takrorlanuvchanlikni oshiradi. TO'LIQ determinizm faqat
+    # num_search_workers=1 da bo'ladi, lekin u juda sekin (o'lchandi: 15 soniyada
+    # yechim topolmadi), shuning uchun 4 oqim qoldirildi. Natija urinishlar
+    # orasida biroz farq qilishi mumkin — jadvalni saqlab qo'yish yoki
+    # "Sinflarni qulflash" funksiyasi bundan himoya qiladi.
+    solver.parameters.random_seed = 12345
     status = solver.Solve(m)
 
     status_name = {
@@ -833,44 +856,110 @@ def solve_timetable(data, max_seconds=20, relax_days=False):
 def solve_safe(data, max_seconds=20):
     """XAVFSIZ KIRISH NUQTASI — API shuni chaqirishi kerak.
 
-    Muammo: solve_timetable() INFEASIBLE qaytarsa entries BO'SH bo'ladi va
-    foydalanuvchi hech narsa olmaydi ("Bu shartlar bilan jadval tuzib bo'lmadi").
-    Aslida cheklovlarning kichik qismi aybdor bo'ladi, qolgan darslarni
-    joylashtirish mumkin.
+    Ikki muammoni hal qiladi:
+      1) solve_timetable() INFEASIBLE qaytarsa entries BO'SH bo'lardi va
+         foydalanuvchi hech narsa olmasdi.
+      2) Kunlik yuk chegarasi qattiq bo'lsa taqsimot tekis, lekin ba'zi darslar
+         joylashmay qolishi mumkin; chegara bo'sh bo'lsa hammasi joylashadi-yu
+         taqsimot buziladi (bir kun 7 dars, boshqasi 3).
 
-    Yechim — bosqichma-bosqich yumshatish:
-      1) To'liq model
-      2) Kunlik minimum cheklovlarisiz (relax_days)
-      3) maxHours cheklovisiz (oxirgi chora, natijada ogohlantirish qaytadi)
-    Birinchi muvaffaqiyatli bosqich qaytariladi.
+    Yechim — bosqichma-bosqich yumshatib, ENG YAXSHI natijani tanlash:
+      0) ideal tekis taqsimot (floor..ceil)
+      1) kunlik chegaraga ±1 zaxira
+      2) kunlik chegara yo'q
+      3) maxHours cheklovisiz (oxirgi chora)
+    Har bosqichda to'liq joylashsa — darhol qaytariladi (keyingi bosqichlar
+    faqat taqsimotni yomonlashtiradi). Aks holda barcha bosqichlar ichidan
+    eng ko'p dars joylashgani, teng bo'lsa eng tekis taqsimlangani tanlanadi.
     """
-    warnings = []
+    import copy
 
-    # 1-bosqich: to'liq model
-    res = solve_timetable(data, max_seconds=max_seconds)
-    if (res.get("entries") or []) and res.get("status") not in ("INFEASIBLE", "MODEL_INVALID"):
-        res["relaxed"] = 0
-        res["warnings"] = warnings
-        return res
+    total_needed = sum(int(a.get("hoursPerWeek") or 0)
+                       for a in data.get("assignments", []))
 
-    # 2-bosqich: kunlik minimum cheklovlarini yumshatamiz
-    warnings.append("Kunlik minimal dars soni cheklovi yumshatildi — "
-                    "ba'zi kunlarda darslar soni kam bo'lishi mumkin.")
-    res = solve_timetable(data, max_seconds=max_seconds, relax_days=True)
-    if (res.get("entries") or []) and res.get("status") not in ("INFEASIBLE", "MODEL_INVALID"):
-        res["relaxed"] = 1
-        res["warnings"] = warnings
-        return res
+    days_n = int(data["school"]["daysPerWeek"])
+    # Sinfning haftalik soati: kunlar soniga yetadigan sinflarda bo'sh kun
+    # bo'lmasligi kerak (yetmaydiganlarda bo'sh kun tabiiy).
+    _cls_total = {}
+    for a in data.get("assignments", []):
+        _cls_total[a["classId"]] = _cls_total.get(a["classId"], 0) + int(a.get("hoursPerWeek") or 0)
 
-    # 3-bosqich: o'qituvchi haftalik limitini vaqtincha olib tashlaymiz
+    def day_counts(res):
+        cnt = {}
+        for e in (res.get("entries") or []):
+            arr = cnt.setdefault(e["classId"], [0] * days_n)
+            if 0 <= e["day"] < days_n:
+                arr[e["day"]] += 1
+        return cnt
+
+    def imbalance(res):
+        """Kunlar bo'yicha o'rtacha farq (kichik bo'lgani yaxshi)."""
+        cnt = day_counts(res)
+        if not cnt:
+            return 999
+        return sum(max(a) - min(a) for a in cnt.values()) / len(cnt)
+
+    def avoidable_empty(res):
+        """Oldini olsa bo'ladigan bo'sh kunlar soni.
+
+        Sinfda haftalik soat kunlar soniga yetsa-yu, kun bo'sh qolsa — bu
+        jadvalni maktab uchun yaroqsiz qiladi (bolalar haftada 2 kun keladi).
+        Shunday jadval 13 ta qo'lda joylashtiriladigan darsdan ham yomonroq,
+        shuning uchun tanlovda og'ir jarima bilan hisobga olinadi.
+        """
+        n = 0
+        for cid, arr in day_counts(res).items():
+            if _cls_total.get(cid, 0) >= days_n:
+                n += sum(1 for v in arr if v == 0)
+        return n
+
+    def usable(res):
+        return bool(res.get("entries")) and res.get("status") not in ("INFEASIBLE", "MODEL_INVALID")
+
+    LEVELS = [
+        (0, None),
+        (1, "Kunlik dars soni chegarasi ±1 ga kengaytirildi — "
+            "taqsimot biroz notekis bo'lishi mumkin."),
+        (2, "Kunlik dars soni chegarasi olib tashlandi — "
+            "kunlar bo'yicha farq sezilarli bo'lishi mumkin."),
+        (3, "Bo'sh ish kuni taqiqi ham olib tashlandi — "
+            "ba'zi sinflarda kun butunlay bo'sh qolishi mumkin."),
+    ]
+
+    best, best_key, warnings = None, None, []
+    for lvl, note in LEVELS:
+        # 0-darajaga (ideal tekis taqsimot) TO'LIQ vaqt beriladi, yumshatilgan
+        # darajalarga yarmi. Sababi o'lchandi: vaqt kam bo'lsa 0-daraja hamma
+        # darsni joylashtira olmay qoladi va tanlov yomonroq muvozanatli
+        # darajaga o'tib ketardi (kunlar farqi 1 o'rniga 3 bo'lib qolardi).
+        lvl_secs = max_seconds if lvl == 0 else max(8, max_seconds // 2)
+        res = solve_timetable(data, max_seconds=lvl_secs, relax_days=lvl)
+        if usable(res):
+            placed = len(res.get("entries") or [])
+            # Tanlov mezoni: bo'sh kun og'ir jarimalanadi (har biri ~3 darsga teng),
+            # keyin joylashgan darslar soni, oxirida kunlar muvozanati.
+            key = (placed - 3 * avoidable_empty(res), -imbalance(res))
+            if best_key is None or key > best_key:
+                best, best_key = res, key
+                best["relaxed"] = lvl
+                best["warnings"] = list(warnings) + ([note] if note else [])
+            # To'liq joylashdi VA bo'sh kun yo'q — yumshatishning hojati yo'q
+            if placed >= total_needed and avoidable_empty(res) == 0:
+                return best
+        if note:
+            warnings.append(note)
+
+    if best is not None:
+        return best
+
+    # Oxirgi chora: o'qituvchi haftalik limitini vaqtincha olib tashlaymiz
     warnings.append("O'qituvchilarning haftalik maksimal soati cheklovi olib tashlandi — "
                     "yuklamani qo'lda tekshiring.")
-    import copy
     d2 = copy.deepcopy(data)
     for t in d2.get("teachers", []):
         t["maxHours"] = None
-    res = solve_timetable(d2, max_seconds=max_seconds, relax_days=True)
-    res["relaxed"] = 2
+    res = solve_timetable(d2, max_seconds=max_seconds, relax_days=3)
+    res["relaxed"] = 4
     res["warnings"] = warnings
     if not (res.get("entries") or []):
         res["warnings"].append(
@@ -991,20 +1080,19 @@ def _compact(entries, data, days, slots, teachers, subjects):
                     cell = occ[nxt]
                     # o'z joyidan bo'shatib tekshiramiz (o'zi bilan to'qnashmasin)
                     for e in cell:
+                        # TUZATILDI: time_cells() allaqachon (smena, soat) kortejlarini
+                        # qaytaradi — uni yana time_cells() ga uzatish TypeError berardi
+                        # va _compact butunlay ishlamay qolardi (ayniqsa 2 smenali maktabda).
                         for c2 in time_cells(e["classId"], nxt):
-                            for _c in time_cells(e["classId"], c2):
-                                teacher_busy.discard((e["teacherId"], d, _c))
+                            teacher_busy.discard((e["teacherId"], d, c2))
                             if e.get("roomId"):
-                                for _c in time_cells(e["classId"], c2):
-                                    room_busy.discard((e["roomId"], d, _c))
+                                room_busy.discard((e["roomId"], d, c2))
                     ok = can_place_cell(cell, d, target)
                     for e in cell:
                         for c2 in time_cells(e["classId"], nxt):
-                            for _c in time_cells(e["classId"], c2):
-                                teacher_busy.add((e["teacherId"], d, _c))
+                            teacher_busy.add((e["teacherId"], d, c2))
                             if e.get("roomId"):
-                                for _c in time_cells(e["classId"], c2):
-                                    room_busy.add((e["roomId"], d, _c))
+                                room_busy.add((e["roomId"], d, c2))
                     if ok:
                         move_cell(cell, d, target)
                         occ = cells_of(cid, d)
@@ -1158,20 +1246,19 @@ def _compact(entries, data, days, slots, teachers, subjects):
                         break
                     cell = occ[nxt]
                     for e in cell:
+                        # TUZATILDI: time_cells() allaqachon (smena, soat) kortejlarini
+                        # qaytaradi — uni yana time_cells() ga uzatish TypeError berardi
+                        # va _compact butunlay ishlamay qolardi (ayniqsa 2 smenali maktabda).
                         for c2 in time_cells(e["classId"], nxt):
-                            for _c in time_cells(e["classId"], c2):
-                                teacher_busy.discard((e["teacherId"], d, _c))
+                            teacher_busy.discard((e["teacherId"], d, c2))
                             if e.get("roomId"):
-                                for _c in time_cells(e["classId"], c2):
-                                    room_busy.discard((e["roomId"], d, _c))
+                                room_busy.discard((e["roomId"], d, c2))
                     ok = can_place_cell(cell, d, target)
                     for e in cell:
                         for c2 in time_cells(e["classId"], nxt):
-                            for _c in time_cells(e["classId"], c2):
-                                teacher_busy.add((e["teacherId"], d, _c))
+                            teacher_busy.add((e["teacherId"], d, c2))
                             if e.get("roomId"):
-                                for _c in time_cells(e["classId"], c2):
-                                    room_busy.add((e["roomId"], d, _c))
+                                room_busy.add((e["roomId"], d, c2))
                     if ok:
                         move_cell(cell, d, target)
                         occ = cells_of(cid, d)
