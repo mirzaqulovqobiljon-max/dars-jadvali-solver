@@ -28,7 +28,7 @@ from typing import Any, Dict
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from solver import solve_safe, ENGINE_VERSION
+from solver import solve_safe, solve_variants, ENGINE_VERSION
 
 app = FastAPI(title="Dars jadvali solver", version="1.1")
 
@@ -50,6 +50,7 @@ class GenerateRequest(BaseModel):
     assignments: list
     fixedEntries: list = []
     maxSeconds: int = 30
+    variants: int = 1        # 2-3 bo'lsa bir necha variant qaytadi
 
 
 @app.get("/health")
@@ -89,9 +90,14 @@ def generate(req: GenerateRequest):
     # bosqich uradi (0-bosqich to'liq vaqt, qolganlari yarmidan). 90 bo'lsa
     # eng yomon holatda 225 s ketardi va klient 240 s da uzib yuborardi.
     # 60 bilan odatiy hol 60 s, eng yomoni ~150 s.
+    secs = max(3, min(60, int(req.maxSeconds)))
     try:
-        result = solve_safe(data, max_seconds=max(3, min(60, int(req.maxSeconds))))
-        return result
+        # variants>1 bo'lsa bir necha xil jadval qaytariladi (foydalanuvchi
+        # tanlaydi). Standart — bitta, ya'ni eski xulq saqlanadi.
+        if int(getattr(req, "variants", 1) or 1) > 1:
+            return solve_variants(data, max_seconds=secs,
+                                  count=int(req.variants))
+        return solve_safe(data, max_seconds=secs)
     except Exception as e:
         # Xizmat hech qachon qulamasin — xatoni tushunarli qaytaramiz
         return {
