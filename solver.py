@@ -410,6 +410,16 @@ def solve_timetable(data, max_seconds=20, relax_days=0):
                 # SMENA: bu sinfda bunday soat umuman yo'q (masalan 2-smenada 5 soat)
                 if ok and s >= cls_slots(a["classId"]):
                     ok = False
+                # BELGILANGAN VAQTLI FAN (subject.fixedSlot) — masalan "Kelajak
+                # soati" har doim dushanba 1-soatda. Bu QAT'IY: fan boshqa
+                # kun/soatga umuman qo'yilmaydi, shuning uchun o'zgaruvchi ham
+                # yaratilmaydi (model kichrayadi, tezlashadi).
+                # Ilgari bu cheklov FAQAT klientda bor edi — server uni
+                # bilmasdi va CP-SAT fanni istalgan joyga qo'yib yuborardi.
+                if ok:
+                    fx = _fixed_slot(subjects.get(a["subjectId"]))
+                    if fx is not None and (d, s) != fx:
+                        ok = False
                 if ok:
                     x[(ai, d, s)] = m.NewBoolVar(f"x_{ai}_{d}_{s}")
 
@@ -1020,6 +1030,130 @@ def solve_safe(data, max_seconds=20):
 
 
 
+
+
+def solve_variants(data, max_seconds=30, count=3):
+    """BIR NECHTA JADVAL VARIANTI — foydalanuvchi eng mosini tanlaydi.
+
+    Sabab: "hech qanday bo'sh oyna bo'lmasin" va "hamma dars joylashsin"
+    talablari ba'zan bir-biriga zid. Qattiq tekis taqsimot bir-ikki darsni
+    joylashtirmay qoldirishi mumkin; chegarani bo'shatsak hammasi joylashadi-yu
+    kunlar notekis bo'ladi. Bitta "to'g'ri" javob yo'q — maktab o'zi tanlashi
+    kerak. Shuning uchun uch xil ustuvorlik bilan yechamiz.
+
+    Har variant validatordan o'tadi; qat'iy cheklov buzilgani chiqarilmaydi.
+    Qaytadi: {"variants": [...], "best": 0, va eng yaxshisining maydonlari}
+    """
+    profiles = [
+        (0, "Muvozanatli", "Darslar hafta kunlariga eng tekis taqsimlangan"),
+        (1, "Moslashuvchan", "Kunlik chegara ±1 — ko'proq dars joylashadi"),
+        (2, "To'liq", "Chegarasiz — maksimal dars joylashtiriladi"),
+    ]
+    profiles = profiles[:max(1, min(3, count))]
+    total_needed = sum(int(a.get("hoursPerWeek") or 0)
+                       for a in data.get("assignments", []))
+
+    per = max(8, int(max_seconds / max(1, len(profiles))))
+    out_list = []
+    seen = set()
+    for lvl, label, note in profiles:
+        try:
+            r = solve_timetable(data, max_seconds=per, relax_days=lvl)
+        except Exception:                                     # noqa: BLE001
+            continue
+        if not (r.get("entries") or []):
+            continue
+        r = _finalize(r, data, total_needed)
+        if not r.get("validation", {}).get("valid"):
+            continue                       # nuqsonli variant ko'rsatilmaydi
+        st = r.get("stats", {})
+        sig = (st.get("placed"), st.get("classGaps"), st.get("dailyImbalance"))
+        if sig in seen:
+            continue                       # bir xil natijani ikki marta ko'rsatmaymiz
+        seen.add(sig)
+        out_list.append({
+            "label": label,
+            "note": note,
+            "relaxed": lvl,
+            "entries": r["entries"],
+            "unfilled": r.get("unfilled") or [],
+            "stats": st,
+            "validation": r.get("validation"),
+            "status": r.get("status"),
+        })
+
+    if not out_list:
+        # Birorta ham toza variant chiqmadi — odatdagi xavfsiz yo'lga o'tamiz
+        res = solve_safe(data, max_seconds=max_seconds)
+        res["variants"] = []
+        return res
+
+    def score(v):
+        st = v["stats"]
+        # Ustuvorlik: joylashgan dars > sinf oynasi > muvozanat > o'qituvchi oynasi
+        return (st.get("placed", 0) * 1000
+                - st.get("classGaps", 0) * 200
+                - float(st.get("dailyImbalance", 0)) * 30
+                - st.get("teacherGaps", 0))
+
+    out_list.sort(key=score, reverse=True)
+
+    # DOMINATSIYA FILTRI: agar variant boshqasidan HAMMA ko'rsatkichda
+    # yomon bo'lsa, uni ko'rsatmaymiz. Foydalanuvchiga aniq yomon variantni
+    # tanlash imkonini berish — yordam emas, chalkashlik.
+    def dominated(v, other):
+        a, b = v["stats"], other["stats"]
+        return (b.get("placed", 0) >= a.get("placed", 0)
+                and b.get("classGaps", 0) <= a.get("classGaps", 0)
+                and float(b.get("dailyImbalance", 0)) <= float(a.get("dailyImbalance", 0))
+                and b.get("teacherGaps", 0) <= a.get("teacherGaps", 0)
+                and (b.get("placed", 0) > a.get("placed", 0)
+                     or b.get("classGaps", 0) < a.get("classGaps", 0)
+                     or float(b.get("dailyImbalance", 0)) < float(a.get("dailyImbalance", 0))
+                     or b.get("teacherGaps", 0) < a.get("teacherGaps", 0)))
+
+    kept = [v for i, v in enumerate(out_list)
+            if not any(dominated(v, o) for j, o in enumerate(out_list) if i != j)]
+    if kept:
+        out_list = kept
+    best = out_list[0]
+    res = {
+        "entries": best["entries"],
+        "unfilled": best["unfilled"],
+        "status": best["status"],
+        "stats": best["stats"],
+        "validation": best["validation"],
+        "relaxed": best["relaxed"],
+        "engineVersion": ENGINE_VERSION,
+        "entry": "solve_variants",
+        "variants": [{"label": v["label"], "note": v["note"],
+                      "entries": v["entries"], "unfilled": v["unfilled"],
+                      "stats": v["stats"]} for v in out_list],
+        "warnings": [],
+    }
+    return res
+
+
+def _fixed_slot(subject):
+    """Fanning qat'iy belgilangan (kun, soat) joyi yoki None.
+
+    Klientdagi fixedSlotOf() bilan bir xil shakl: {"day": 0, "lesson": 0}.
+    Masalan "Kelajak soati" — dushanba (0) birinchi soat (0).
+    """
+    if not subject:
+        return None
+    f = subject.get("fixedSlot")
+    if not f:
+        return None
+    d, l = f.get("day"), f.get("lesson")
+    if d is None or l is None:
+        return None
+    try:
+        return (int(d), int(l))
+    except (TypeError, ValueError):
+        return None
+
+
 def _finalize(res, data, total_needed):
     """Javobni yakunlaydi: validatordan o'tkazadi va stats to'ldiradi.
 
@@ -1137,6 +1271,10 @@ def validate_schedule(entries, data):
                 errors.append("O'qituvchi band deb belgilangan vaqt: %s, %d-kun %d-soat"
                               % (tname(e["teacherId"]), e["day"] + 1, e["lesson"] + 1))
         sub = subjects.get(e.get("subjectId"))
+        fx = _fixed_slot(sub)
+        if fx is not None and (e["day"], e["lesson"]) != fx:
+            errors.append("Belgilangan vaqt buzildi: %s %d-kun %d-soatda bo'lishi kerak"
+                          % (sub.get("name", ""), fx[0] + 1, fx[1] + 1))
         if sub and (sub.get("unavailable") or {}).get("%d-%d" % (e["day"], e["lesson"])):
             errors.append("Fan cheklovi buzildi: %s, %d-kun %d-soat"
                           % (sub.get("name", ""), e["day"] + 1, e["lesson"] + 1))
