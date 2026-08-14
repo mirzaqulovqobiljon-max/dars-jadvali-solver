@@ -483,6 +483,19 @@ def solve_timetable(data, max_seconds=20, relax_days=0):
         # (bir kun 7 dars, boshqasi 3). Bosqichli yondashuv ikkovini ham hal qiladi.
         even_hi = math.ceil(total_c / work_days)
         even_lo = total_c // work_days
+
+        # JUFT DARS ISTISNOSI: agar sinfda doubleLesson fani bo'lsa, kunlik
+        # yuqori chegara kamida 2 bo'lishi SHART. Aks holda haftalik soati
+        # kunlar sonidan kam fanlarda (masalan 2 soat / 6 kun -> ceil = 1)
+        # chegara juft darsni JISMONAN imkonsiz qilib qo'yadi va u ikki
+        # kunga ajralib ketadi. (Test 7 aynan shu holatni ushlagan.)
+        has_double = any(
+            (subjects.get(a["subjectId"]) or {}).get("doubleLesson")
+            and int(a.get("hoursPerWeek") or 0) >= 2
+            for a in assignments if a["classId"] == c
+        )
+        if has_double:
+            even_hi = max(even_hi, 2)
         if relax_days >= 3:
             # oxirgi chora: hech qanday kunlik chegara yo'q
             hi_day = cls_slots(c)
@@ -830,9 +843,15 @@ def solve_timetable(data, max_seconds=20, relax_days=0):
                             })
             hours = int(a.get("hoursPerWeek") or 0)
             if got < hours:
+                # `hours` maydoni ESKI KLIENT bilan moslik uchun saqlanadi.
+                # Qolganlari — nega joylashmaganini tushuntirish uchun.
                 unfilled.append({
                     "classId": a["classId"], "subjectId": a["subjectId"],
                     "teacherId": a["teacherId"], "hours": hours - got,
+                    "requestedHours": hours,
+                    "placedHours": got,
+                    "missingHours": hours - got,
+                    "reason": _unfilled_reason(a, data),
                 })
 
     # ===== 2-BOSQICH: COMPACTION (zichlash) =====
@@ -956,18 +975,33 @@ def solve_safe(data, max_seconds=20):
             if placed >= total_needed and avoidable_empty(res) == 0:
                 best["engineVersion"] = ENGINE_VERSION
                 best["entry"] = "solve_safe"
-                return best
+                return _finalize(best, data, total_needed)
         if note:
             warnings.append(note)
 
     if best is not None:
         best["engineVersion"] = ENGINE_VERSION
         best["entry"] = "solve_safe"
-        return best
+        return _finalize(best, data, total_needed)
 
-    # Oxirgi chora: o'qituvchi haftalik limitini vaqtincha olib tashlaymiz
-    warnings.append("O'qituvchilarning haftalik maksimal soati cheklovi olib tashlandi — "
-                    "yuklamani qo'lda tekshiring.")
+    # Oxirgi chora: o'qituvchi haftalik limitini olib tashlash.
+    # DIQQAT: bu AVTOMATIK bajarilmaydi. maxHours — real cheklov (mehnat
+    # shartnomasi, stavka), uni jimgina buzish jadvalni yaroqsiz qiladi.
+    # Faqat foydalanuvchi ataylab `allowTeacherOverload: true` qo'ysa ishlaydi.
+    if not data.get("allowTeacherOverload"):
+        res = solve_timetable(data, max_seconds=max_seconds, relax_days=3)
+        res["relaxed"] = 3
+        res["warnings"] = warnings + [
+            "Barcha darslarni joylashtirib bo'lmadi. O'qituvchilarning haftalik "
+            "maksimal soati (maxHours) cheklovi SAQLANDI — u avtomatik "
+            "buzilmaydi. Joylashmagan darslar sabablari bilan `unfilled` "
+            "ro'yxatida qaytarildi."]
+        res["engineVersion"] = ENGINE_VERSION
+        res["entry"] = "solve_safe"
+        return _finalize(res, data, total_needed)
+
+    warnings.append("O'qituvchilarning haftalik maksimal soati cheklovi olib tashlandi "
+                    "(allowTeacherOverload=true) — yuklamani qo'lda tekshiring.")
     d2 = copy.deepcopy(data)
     for t in d2.get("teachers", []):
         t["maxHours"] = None
@@ -981,6 +1015,305 @@ def solve_safe(data, max_seconds=20):
             "Jadval tuzilmadi. Sabab odatda ma'lumotda: sinf haftalik soati kunlik "
             "sig'imdan ortiq, yoki o'qituvchilarda metodik kun/band soatlar juda ko'p.")
     return res
+
+
+
+
+
+def _finalize(res, data, total_needed):
+    """Javobni yakunlaydi: validatordan o'tkazadi va stats to'ldiradi.
+
+    Bu yerda jadval O'ZGARTIRILMAYDI — faqat tekshiriladi va o'lchanadi.
+    Post-processing bosqichlari (compaction) allaqachon tugagan, shuning uchun
+    validator ularning natijasini ham qamrab oladi.
+    """
+    entries = res.get("entries") or []
+    v = validate_schedule(entries, data)
+    placed = sum(1 for e in entries if e.get("group") != "B")
+    st = res.get("stats") or {}
+    st.update({
+        "requested": total_needed,
+        "placed": placed,
+        "unfilled": sum(int(u.get("missingHours") or u.get("hours") or 0)
+                        for u in (res.get("unfilled") or [])),
+        "classGaps": v["stats"]["classGaps"],
+        "teacherGaps": v["stats"]["teacherGaps"],
+        "dailyImbalance": v["stats"]["dailyImbalance"],
+    })
+    res["stats"] = st
+    res["validation"] = {"valid": v["valid"], "errors": v["errors"],
+                         "warnings": v["warnings"][:20]}
+    if not v["valid"]:
+        # Qat'iy cheklov buzilgan bo'lsa buni YASHIRMAYMIZ — klient
+        # verifySolverOutput() orqali javobni rad etib, zaxiraga o'tadi.
+        res["status"] = "INVALID"
+        res.setdefault("warnings", []).append(
+            "Jadval yakuniy tekshiruvdan o'tmadi: " + "; ".join(v["errors"][:3]))
+    return res
+
+
+def validate_schedule(entries, data):
+    """YAKUNIY NAZORATCHI — jadval qat'iy cheklovlarni buzmaganini tekshiradi.
+
+    Solverdan ALOHIDA yozilgan: solver o'zini o'zi "to'g'ri" deb e'lon qila
+    olmasligi kerak. Har qanday post-processing (compaction, ta'mirlash)
+    dan KEYIN chaqiriladi.
+
+    Qaytaradi: {"valid": bool, "errors": [...], "warnings": [...], "stats": {...}}
+    valid=False bo'lsa jadval frontendga yuborilmasligi kerak.
+    """
+    errors, warnings = [], []
+    school = data.get("school", {})
+    days = _num(school.get("daysPerWeek"), 6)
+
+    teachers = {t["id"]: t for t in data.get("teachers", [])}
+    classes = {c["id"]: c for c in data.get("classes", [])}
+    subjects = {sb["id"]: sb for sb in data.get("subjects", [])}
+
+    def cshift(cid):
+        c = classes.get(cid)
+        return _num(c.get("shift"), 1) if c else 1
+
+    def cname(cid):
+        c = classes.get(cid)
+        return c.get("name", cid) if c else cid
+
+    def tname(tid):
+        t = teachers.get(tid)
+        return t.get("name", tid) if t else tid
+
+    # --- To'qnashuvlar: REAL VAQT bo'yicha (smena raqami emas) ---
+    # Bir kunda har juftlikni tekshiramiz, lekin faqat kerakli guruhlar ichida —
+    # O(n^2) butun jadval bo'yicha emas, o'qituvchi/xona bo'yicha.
+    by_teacher, by_room, by_class = {}, {}, {}
+    for e in entries:
+        by_teacher.setdefault((e.get("teacherId"), e.get("day")), []).append(e)
+        if e.get("roomId"):
+            by_room.setdefault((e["roomId"], e.get("day")), []).append(e)
+        by_class.setdefault((e.get("classId"), e.get("day")), []).append(e)
+
+    def time_clash(e1, e2):
+        return slots_overlap(school, cshift(e1["classId"]), e1["lesson"],
+                             cshift(e2["classId"]), e2["lesson"])
+
+    for (tid, d), lst in by_teacher.items():
+        for i in range(len(lst)):
+            for j in range(i + 1, len(lst)):
+                a, b = lst[i], lst[j]
+                # Bo'linadigan dars: A va B guruh BIR sinfda, bir slotda —
+                # ular turli o'qituvchida bo'ladi, shuning uchun bu yerga tushmaydi.
+                if a["classId"] == b["classId"] and a["lesson"] == b["lesson"]:
+                    continue
+                if time_clash(a, b):
+                    errors.append("O'qituvchi to'qnashuvi: %s, %d-kun, %s va %s"
+                                  % (tname(tid), d + 1, cname(a["classId"]), cname(b["classId"])))
+
+    for (rid, d), lst in by_room.items():
+        for i in range(len(lst)):
+            for j in range(i + 1, len(lst)):
+                a, b = lst[i], lst[j]
+                if a["classId"] == b["classId"] and a["lesson"] == b["lesson"]:
+                    continue
+                if time_clash(a, b):
+                    errors.append("Xona to'qnashuvi: %s, %d-kun, %d-soat"
+                                  % (rid, d + 1, a["lesson"] + 1))
+
+    for (cid, d), lst in by_class.items():
+        seen = {}
+        for e in lst:
+            key = (e["lesson"], e.get("group"))
+            if key in seen:
+                errors.append("Sinf to'qnashuvi: %s, %d-kun, %d-soat"
+                              % (cname(cid), d + 1, e["lesson"] + 1))
+            seen[key] = 1
+
+    # --- O'qituvchi bandligi, metodik kun, fan cheklovi, smena chegarasi ---
+    for e in entries:
+        t = teachers.get(e.get("teacherId"))
+        if t:
+            if t.get("methodicalDay") is not None and int(t["methodicalDay"]) == e["day"]:
+                errors.append("Metodik kun buzildi: %s, %d-kun" % (tname(e["teacherId"]), e["day"] + 1))
+            if (t.get("unavailable") or {}).get("%d-%d" % (e["day"], e["lesson"])):
+                errors.append("O'qituvchi band deb belgilangan vaqt: %s, %d-kun %d-soat"
+                              % (tname(e["teacherId"]), e["day"] + 1, e["lesson"] + 1))
+        sub = subjects.get(e.get("subjectId"))
+        if sub and (sub.get("unavailable") or {}).get("%d-%d" % (e["day"], e["lesson"])):
+            errors.append("Fan cheklovi buzildi: %s, %d-kun %d-soat"
+                          % (sub.get("name", ""), e["day"] + 1, e["lesson"] + 1))
+        c = classes.get(e.get("classId"))
+        if c and (c.get("busyDays") or {}).get(str(e["day"])) or (c and (c.get("busyDays") or {}).get(e["day"])):
+            errors.append("Sinf dam kunida dars: %s, %d-kun" % (cname(e["classId"]), e["day"] + 1))
+        per = shift_cfg(school, cshift(e.get("classId")))["lessons"]
+        if e["lesson"] < 0 or e["lesson"] >= per:
+            errors.append("Smena chegarasidan tashqari: %s, %d-soat"
+                          % (cname(e["classId"]), e["lesson"] + 1))
+        if e["day"] < 0 or e["day"] >= days:
+            errors.append("Ish kunidan tashqari: %s, %d-kun" % (cname(e["classId"]), e["day"] + 1))
+
+    # --- Sinf kunidagi PREFIKS qoidasi (bo'sh oyna bo'lmasin) ---
+    class_gaps = 0
+    for (cid, d), lst in by_class.items():
+        used = set(e["lesson"] for e in lst)
+        if not used:
+            continue
+        for sslot in range(max(used)):
+            if sslot not in used:
+                class_gaps += 1
+                warnings.append("Bo'sh oyna: %s, %d-kun, %d-soat"
+                                % (cname(cid), d + 1, sslot + 1))
+
+    # --- Haftalik soat: rejadan ORTIQ bo'lmasin (kam bo'lishi unfilled orqali) ---
+    need, got = {}, {}
+    for a in data.get("assignments", []):
+        k = (a.get("classId"), a.get("subjectId"))
+        need[k] = need.get(k, 0) + int(a.get("hoursPerWeek") or 0)
+    for e in entries:
+        if e.get("group") == "B":
+            continue
+        k = (e.get("classId"), e.get("subjectId"))
+        got[k] = got.get(k, 0) + 1
+    for k, v in got.items():
+        if v > need.get(k, 0):
+            errors.append("Rejadan ortiqcha soat: %s, %d o'rniga %d"
+                          % (cname(k[0]), need.get(k, 0), v))
+
+    # --- O'qituvchi haftalik limiti ---
+    tload = {}
+    for e in entries:
+        tload[e.get("teacherId")] = tload.get(e.get("teacherId"), 0) + 1
+    for tid, n in tload.items():
+        t = teachers.get(tid)
+        if not t:
+            continue
+        mx = _num(t.get("maxHours"), 0)
+        if mx and n > mx:
+            errors.append("Haftalik limit buzildi: %s, %d soat (maksimum %d)"
+                          % (tname(tid), n, mx))
+
+    # --- O'qituvchi bo'sh oynalari (faqat ogohlantirish) ---
+    teacher_gaps = 0
+    for (tid, d), lst in by_teacher.items():
+        used = set(e["lesson"] for e in lst)
+        if used:
+            teacher_gaps += sum(1 for x in range(max(used)) if x not in used)
+
+    # --- Kunlik nomutanosiblik ---
+    per_class_day = {}
+    for e in entries:
+        if e.get("group") == "B":
+            continue
+        per_class_day.setdefault(e["classId"], [0] * days)
+        if 0 <= e["day"] < days:
+            per_class_day[e["classId"]][e["day"]] += 1
+    imbalance = 0
+    if per_class_day:
+        imbalance = sum(max(v) - min(v) for v in per_class_day.values()) / len(per_class_day)
+
+    return {
+        "valid": len(errors) == 0,
+        "errors": errors[:50],
+        "warnings": warnings[:50],
+        "stats": {
+            "classGaps": class_gaps,
+            "teacherGaps": teacher_gaps,
+            "dailyImbalance": round(imbalance, 2),
+            "errorCount": len(errors),
+        },
+    }
+
+
+def _unfilled_reason(a, data):
+    """Nega bu dars joylashmadi — eng ehtimoliy sababni matn qilib qaytaradi.
+
+    Diagnostika `diagnose()` bilan bir xil mantiqda, lekin bitta biriktirish
+    uchun. Frontend buni to'g'ridan-to'g'ri foydalanuvchiga ko'rsatadi.
+    """
+    school = data.get("school", {})
+    days = _num(school.get("daysPerWeek"), 6)
+    need = int(a.get("hoursPerWeek") or 0)
+
+    teachers = {t["id"]: t for t in data.get("teachers", [])}
+    classes = {c["id"]: c for c in data.get("classes", [])}
+    subjects = {sb["id"]: sb for sb in data.get("subjects", [])}
+
+    t = teachers.get(a.get("teacherId"))
+    c = classes.get(a.get("classId"))
+    sub = subjects.get(a.get("subjectId"))
+
+    if t is None:
+        return "O'qituvchi topilmadi (o'chirilgan yoki tanlanmagan)"
+    if c is None:
+        return "Sinf topilmadi (o'chirilgan)"
+
+    per = shift_cfg(school, _num(c.get("shift"), 1))["lessons"]
+
+    # 1) O'qituvchining haftalik limiti
+    t_need = 0
+    for x in data.get("assignments", []):
+        h = int(x.get("hoursPerWeek") or 0)
+        if x.get("teacherId") == t["id"]:
+            t_need += h
+        if x.get("isSplit") and x.get("splitTeacherId") == t["id"]:
+            t_need += h
+    mx = _num(t.get("maxHours"), 0)
+    if mx and t_need > mx:
+        return ("O'qituvchi %s ga jami %d soat biriktirilgan, ruxsat etilgan "
+                "maksimum %d soat" % (t.get("name", t["id"]), t_need, mx))
+
+    # 2) O'qituvchining bo'sh kataklari yetadimi
+    work_days = days - (1 if t.get("methodicalDay") is not None else 0)
+    blocked = 0
+    for k, v in (t.get("unavailable") or {}).items():
+        if not v:
+            continue
+        try:
+            dd = int(str(k).split("-")[0])
+        except (ValueError, IndexError):
+            continue
+        if dd < days and str(t.get("methodicalDay")) != str(dd):
+            blocked += 1
+    cap = work_days * per - blocked
+    if t_need > cap:
+        return ("O'qituvchi %s ning bo'sh vaqti yetmaydi: %d soat kerak, "
+                "%d ta bo'sh katak bor (metodik kun va band soatlar hisobga olindi)"
+                % (t.get("name", t["id"]), t_need, cap))
+
+    # 3) Sinf sig'imi
+    c_need = sum(int(x.get("hoursPerWeek") or 0)
+                 for x in data.get("assignments", [])
+                 if x.get("classId") == c["id"])
+    busy = sum(1 for v in (c.get("busyDays") or {}).values() if v)
+    c_cap = (days - busy) * per
+    if c_need > c_cap:
+        return ("Sinf %s sig'imi yetmaydi: %d soat kerak, kunlik %d soatdan "
+                "%d kunga jami %d katak" % (c.get("name", c["id"]), c_need,
+                                            per, days - busy, c_cap))
+
+    # 4) Fan cheklovi
+    if sub is not None:
+        blocked_s = sum(1 for k, v in (sub.get("unavailable") or {}).items()
+                        if v and str(k).split("-")[0].isdigit()
+                        and int(str(k).split("-")[0]) < days)
+        if blocked_s >= days * per:
+            return "Fan %s uchun barcha kun/soatlar taqiqlangan" % sub.get("name", "")
+        if blocked_s > days * per * 0.5:
+            return ("Fan %s uchun kun/soat cheklovlari juda qattiq (%d katak taqiqlangan)"
+                    % (sub.get("name", ""), blocked_s))
+
+    # 5) Maxsus xona
+    if a.get("roomId"):
+        r_need = sum(int(x.get("hoursPerWeek") or 0)
+                     for x in data.get("assignments", [])
+                     if x.get("roomId") == a["roomId"])
+        two = int(school.get("shiftMode") or 1) == 2
+        r_cap = days * shift_cfg(school, 1)["lessons"]
+        if two:
+            r_cap += days * shift_cfg(school, 2)["lessons"]
+        if r_need > r_cap:
+            return "Maxsus xona band: %d soat talab, sig'imi %d soat" % (r_need, r_cap)
+
+    return ("Sinf va o'qituvchining bo'sh vaqtlari mos kelmadi "
+            "(boshqa darslar bilan to'qnashuv)")
 
 
 def _compact(entries, data, days, slots, teachers, subjects):
