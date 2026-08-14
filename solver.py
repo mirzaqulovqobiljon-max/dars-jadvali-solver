@@ -42,6 +42,12 @@ Cheklovlar:
 """
 from ortools.sat.python import cp_model
 
+# Versiya belgisi — klient serverda qaysi kod turganini shu orqali aniqlaydi.
+# "entry" maydoni esa API qaysi funksiyani chaqirganini ko'rsatadi:
+#   solve_safe      -> to'g'ri (INFEASIBLE kaskadi va tekis taqsimot ishlaydi)
+#   solve_timetable -> NOTO'G'RI (yumshatish kaskadi ishlamaydi)
+ENGINE_VERSION = "v2-2026-08"
+
 
 def diagnose(data):
     """Jadval to'liq chiqmasligining ANIQ sabablarini topadi (o'zbekcha xabarlar).
@@ -844,6 +850,8 @@ def solve_timetable(data, max_seconds=20, relax_days=0):
         "entries": entries,
         "unfilled": unfilled,
         "status": status_name,
+        "engineVersion": ENGINE_VERSION,
+        "entry": "solve_timetable",
         "stats": {
             "objective": solver.ObjectiveValue() if status in (cp_model.OPTIMAL, cp_model.FEASIBLE) else None,
             "wall_time": solver.WallTime(),
@@ -852,8 +860,6 @@ def solve_timetable(data, max_seconds=20, relax_days=0):
     }
 
 
-
-ENGINE_VERSION = "v2-2026-08"   # tuzatilgan versiya belgisi (klient shu bo'yicha tekshiradi)
 
 
 def solve_safe(data, max_seconds=20):
@@ -949,12 +955,14 @@ def solve_safe(data, max_seconds=20):
             # To'liq joylashdi VA bo'sh kun yo'q — yumshatishning hojati yo'q
             if placed >= total_needed and avoidable_empty(res) == 0:
                 best["engineVersion"] = ENGINE_VERSION
+                best["entry"] = "solve_safe"
                 return best
         if note:
             warnings.append(note)
 
     if best is not None:
         best["engineVersion"] = ENGINE_VERSION
+        best["entry"] = "solve_safe"
         return best
 
     # Oxirgi chora: o'qituvchi haftalik limitini vaqtincha olib tashlaymiz
@@ -967,6 +975,7 @@ def solve_safe(data, max_seconds=20):
     res["relaxed"] = 4
     res["warnings"] = warnings
     res["engineVersion"] = ENGINE_VERSION
+    res["entry"] = "solve_safe"
     if not (res.get("entries") or []):
         res["warnings"].append(
             "Jadval tuzilmadi. Sabab odatda ma'lumotda: sinf haftalik soati kunlik "
