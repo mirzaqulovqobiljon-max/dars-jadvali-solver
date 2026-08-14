@@ -28,7 +28,7 @@ from typing import Any, Dict
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from solver import solve_timetable
+from solver import solve_safe, ENGINE_VERSION
 
 app = FastAPI(title="Dars jadvali solver", version="1.1")
 
@@ -49,7 +49,7 @@ class GenerateRequest(BaseModel):
     rooms: list = []
     assignments: list
     fixedEntries: list = []
-    maxSeconds: int = 20
+    maxSeconds: int = 30
 
 
 @app.get("/health")
@@ -61,7 +61,9 @@ def health():
             model = _pick_model(key)
         except Exception:
             model = None
-    return {"status": "ok", "ai": bool(key), "model": model}
+    # engineVersion/entry — klient serverda qaysi kod turganini shu orqali biladi
+    return {"status": "ok", "ai": bool(key), "model": model,
+            "engineVersion": ENGINE_VERSION, "entry": "solve_safe"}
 
 
 @app.post("/generate")
@@ -75,14 +77,27 @@ def generate(req: GenerateRequest):
         "assignments": req.assignments,
         "fixedEntries": req.fixedEntries,
     }
+    # MUHIM: solve_timetable EMAS, solve_safe chaqiriladi.
+    #   solve_timetable — bitta model. Cheklovlar qattiq bo'lsa INFEASIBLE
+    #                     qaytaradi va entries BO'SH bo'ladi: foydalanuvchi
+    #                     "jadval tuzib bo'lmadi" xabarini ko'rib qoladi.
+    #   solve_safe      — bosqichma-bosqich yumshatib eng yaxshi natijani
+    #                     tanlaydi (ideal tekis taqsimot -> ±1 -> chegarasiz ->
+    #                     maxHours siz) va hech qachon bo'sh jadval qaytarmaydi.
+    #
+    # Vaqt chegarasi 90 -> 60 ga tushirildi: solve_safe kerak bo'lsa bir necha
+    # bosqich uradi (0-bosqich to'liq vaqt, qolganlari yarmidan). 90 bo'lsa
+    # eng yomon holatda 225 s ketardi va klient 240 s da uzib yuborardi.
+    # 60 bilan odatiy hol 60 s, eng yomoni ~150 s.
     try:
-        result = solve_timetable(data, max_seconds=max(3, min(90, int(req.maxSeconds))))
+        result = solve_safe(data, max_seconds=max(3, min(60, int(req.maxSeconds))))
         return result
     except Exception as e:
         # Xizmat hech qachon qulamasin — xatoni tushunarli qaytaramiz
         return {
             "entries": [], "unfilled": [], "status": "ERROR",
             "error": str(e), "stats": {},
+            "engineVersion": ENGINE_VERSION, "entry": "solve_safe",
         }
 
 
