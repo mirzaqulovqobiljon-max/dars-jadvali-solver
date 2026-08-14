@@ -853,6 +853,9 @@ def solve_timetable(data, max_seconds=20, relax_days=0):
 
 
 
+ENGINE_VERSION = "v2-2026-08"   # tuzatilgan versiya belgisi (klient shu bo'yicha tekshiradi)
+
+
 def solve_safe(data, max_seconds=20):
     """XAVFSIZ KIRISH NUQTASI — API shuni chaqirishi kerak.
 
@@ -945,11 +948,13 @@ def solve_safe(data, max_seconds=20):
                 best["warnings"] = list(warnings) + ([note] if note else [])
             # To'liq joylashdi VA bo'sh kun yo'q — yumshatishning hojati yo'q
             if placed >= total_needed and avoidable_empty(res) == 0:
+                best["engineVersion"] = ENGINE_VERSION
                 return best
         if note:
             warnings.append(note)
 
     if best is not None:
+        best["engineVersion"] = ENGINE_VERSION
         return best
 
     # Oxirgi chora: o'qituvchi haftalik limitini vaqtincha olib tashlaymiz
@@ -961,6 +966,7 @@ def solve_safe(data, max_seconds=20):
     res = solve_timetable(d2, max_seconds=max_seconds, relax_days=3)
     res["relaxed"] = 4
     res["warnings"] = warnings
+    res["engineVersion"] = ENGINE_VERSION
     if not (res.get("entries") or []):
         res["warnings"].append(
             "Jadval tuzilmadi. Sabab odatda ma'lumotda: sinf haftalik soati kunlik "
