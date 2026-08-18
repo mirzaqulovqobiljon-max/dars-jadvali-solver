@@ -40,6 +40,7 @@ Cheklovlar:
    - kunlar muvozanati (bir kun juda ko'p / juda kam bo'lmasin)
    - og'ir fanlar ertaroq soatlarga
 """
+import math
 from ortools.sat.python import cp_model
 
 # Versiya belgisi — klient serverda qaysi kod turganini shu orqali aniqlaydi.
@@ -72,7 +73,7 @@ def diagnose(data):
     cls_names = {c["id"]: c.get("name", c["id"]) for c in data["classes"]}
     cls_load = {}
     for a in data["assignments"]:
-        cls_load[a["classId"]] = cls_load.get(a["classId"], 0) + int(a.get("hoursPerWeek") or 0)
+        cls_load[a["classId"]] = cls_load.get(a["classId"], 0) + _hours_ceil(a)
     for cid, load in cls_load.items():
         total_slots = _cls_total_slots(cid)     # shu sinfning haqiqiy joy soni
         if load > total_slots:
@@ -85,7 +86,7 @@ def diagnose(data):
     # 2) O'QITUVCHI: bo'sh vaqti / max soatidan ko'p yuk berilganmi?
     t_load = {}
     for a in data["assignments"]:
-        h = int(a.get("hoursPerWeek") or 0)
+        h = _hours_ceil(a)
         t_load[a["teacherId"]] = t_load.get(a["teacherId"], 0) + h
         if a.get("isSplit") and a.get("splitTeacherId"):
             t_load[a["splitTeacherId"]] = t_load.get(a["splitTeacherId"], 0) + h
@@ -154,13 +155,13 @@ def _greedy_seed(data, days, slots, teachers, subjects, assignments):
     # Har biriktirishni soatlarga yoyamiz; eng cheklangan (qiyin) o'qituvchilar avval
     tasks = []
     for ai, a in enumerate(assignments):
-        for _ in range(int(a.get("hoursPerWeek") or 0)):
+        for _ in range(_hours_ceil(a)):
             tasks.append((ai, a))
 
     def constraint_score(item):
         ai, a = item
         t = teachers.get(a["teacherId"], {})
-        load = sum(int(b.get("hoursPerWeek") or 0) for b in assignments
+        load = sum(_hours_ceil(b) for b in assignments
                    if b["teacherId"] == a["teacherId"])
         meth = 1 if t.get("methodicalDay") is not None else 0
         unav = len([1 for v in (t.get("unavailable") or {}).values() if v])
@@ -426,7 +427,7 @@ def solve_timetable(data, max_seconds=20, relax_days=0):
     # Har assignment ko'pi bilan hours marta joylashadi (kamroq bo'lishi mumkin -> unfilled)
     placed = {}
     for ai, a in enumerate(assignments):
-        hours = int(a.get("hoursPerWeek") or 0)
+        hours = _hours_ceil(a)
         vars_a = [x[(ai, d, s)] for d in D for s in S if (ai, d, s) in x]
         p = m.NewIntVar(0, hours, f"placed_{ai}")
         if vars_a:
@@ -470,7 +471,7 @@ def solve_timetable(data, max_seconds=20, relax_days=0):
     MIN_PER_DAY = 4
     import math
     for c in class_ids:
-        total_c = sum(int(a.get("hoursPerWeek") or 0)
+        total_c = sum(_hours_ceil(a)
                       for a in assignments if a["classId"] == c)
         busy = class_busy.get(c, set())
         work_days = max(1, days - len([d for d in D if d in busy]))  # haqiqiy ish kunlari
@@ -501,7 +502,7 @@ def solve_timetable(data, max_seconds=20, relax_days=0):
         # kunga ajralib ketadi. (Test 7 aynan shu holatni ushlagan.)
         has_double = any(
             (subjects.get(a["subjectId"]) or {}).get("doubleLesson")
-            and int(a.get("hoursPerWeek") or 0) >= 2
+            and _hours_ceil(a) >= 2
             for a in assignments if a["classId"] == c
         )
         if has_double:
@@ -591,7 +592,7 @@ def solve_timetable(data, max_seconds=20, relax_days=0):
     subj_week_hours = {}
     for a in assignments:
         key = (a["classId"], a["subjectId"])
-        subj_week_hours[key] = subj_week_hours.get(key, 0) + int(a.get("hoursPerWeek") or 0)
+        subj_week_hours[key] = subj_week_hours.get(key, 0) + _hours_ceil(a)
     # JUFT DARS (subject.doubleLesson = True): kuniga ko'pi bilan 2 dars va ular
     # ALBATTA KETMA-KET bo'lishi SHART (masalan 3- va 4-soat).
     csd = {}   # (cid, subid, d) -> {slot: [var, ...]}
@@ -645,7 +646,14 @@ def solve_timetable(data, max_seconds=20, relax_days=0):
             double_singles.append(cnt - 2 * is2)
         else:
             wh = subj_week_hours.get((cid, subid), 0)
-            max_per_day = 2 if wh > days else 1
+            # "Kunda 1 marta" chegarasi HAFTA KUNLARI soniga emas, o'qituvchining
+            # HAQIQIY ISH KUNLARIGA qarab qo'yiladi. Sabab: haftaning yarmini
+            # "band" deb belgilagan o'qituvchida (masalan faqat dushanba-chorshanba)
+            # 4 soatlik fan 3 kunga sig'maydi va dars butunlay joylashmay qolardi.
+            # O'lchandi: 73 ta joylashmagan darsning yarmidan ko'pi shundan edi.
+            eff = _teacher_work_days(cid, subid, assignments, teachers, days, slots)
+            limit = eff if eff > 0 else days
+            max_per_day = 2 if wh > limit else 1
             if len(all_vars) > max_per_day:
                 m.Add(sum(all_vars) <= max_per_day)
 
@@ -718,7 +726,7 @@ def solve_timetable(data, max_seconds=20, relax_days=0):
     #    kunida dars bo'lishini rag'batlantiramiz (bir kun butunlay bo'sh qolmasin).
     W_EMPTYDAY = 90   # ish kunini bo'sh qoldirish uchun jarima (kuchli)
     for c in class_ids:
-        total = sum(int(a.get("hoursPerWeek") or 0)
+        total = sum(_hours_ceil(a)
                     for a in assignments if a["classId"] == c)
         if total <= 0:
             continue
@@ -748,7 +756,7 @@ def solve_timetable(data, max_seconds=20, relax_days=0):
     #    DIQQAT: bu qism ko'p o'zgaruvchi qo'shadi. Katta masalada (ko'p sinf/o'qituvchi)
     #    uni o'chiramiz — shunda solver maksimal dars joylashtirishga e'tibor beradi
     #    va tez ishlaydi. Kichik masalada esa o'qituvchi jadvalini ixchamlaymiz.
-    total_hours = sum(int(a.get("hoursPerWeek") or 0) for a in assignments)
+    total_hours = sum(_hours_ceil(a) for a in assignments)
     enable_tgap = (total_hours <= 120)   # ~15 sinfgacha to'liq optimallashtiramiz
     if enable_tgap:
         teacher_ids = [t["id"] for t in data["teachers"]]
@@ -851,7 +859,7 @@ def solve_timetable(data, max_seconds=20, relax_days=0):
                                 "day": d, "lesson": s,
                                 "group": "B",
                             })
-            hours = int(a.get("hoursPerWeek") or 0)
+            hours = _hours_ceil(a)
             if got < hours:
                 # `hours` maydoni ESKI KLIENT bilan moslik uchun saqlanadi.
                 # Qolganlari — nega joylashmaganini tushuntirish uchun.
@@ -912,7 +920,7 @@ def solve_safe(data, max_seconds=20):
     """
     import copy
 
-    total_needed = sum(int(a.get("hoursPerWeek") or 0)
+    total_needed = sum(_hours_ceil(a)
                        for a in data.get("assignments", []))
 
     days_n = int(data["school"]["daysPerWeek"])
@@ -920,7 +928,7 @@ def solve_safe(data, max_seconds=20):
     # bo'lmasligi kerak (yetmaydiganlarda bo'sh kun tabiiy).
     _cls_total = {}
     for a in data.get("assignments", []):
-        _cls_total[a["classId"]] = _cls_total.get(a["classId"], 0) + int(a.get("hoursPerWeek") or 0)
+        _cls_total[a["classId"]] = _cls_total.get(a["classId"], 0) + _hours_ceil(a)
 
     def day_counts(res):
         cnt = {}
@@ -1050,7 +1058,7 @@ def solve_variants(data, max_seconds=30, count=3):
         (2, "To'liq", "Chegarasiz — maksimal dars joylashtiriladi"),
     ]
     profiles = profiles[:max(1, min(3, count))]
-    total_needed = sum(int(a.get("hoursPerWeek") or 0)
+    total_needed = sum(_hours_ceil(a)
                        for a in data.get("assignments", []))
 
     per = max(8, int(max_seconds / max(1, len(profiles))))
@@ -1132,6 +1140,69 @@ def solve_variants(data, max_seconds=30, count=3):
         "warnings": [],
     }
     return res
+
+
+
+def _hours_ceil(a):
+    """Biriktirishning KATAK soni (yarim soat ham bitta katak egallaydi).
+
+    Muammo: ilgari hamma joyda int(hoursPerWeek) ishlatilardi. Python'da
+    int(2.5) == 2 va int(0.5) == 0 — ya'ni yarim soatlik darslar JIMGINA
+    yo'qolardi. Interfeys "Geografiya½" deb ko'rsatib turardi-yu, solver uni
+    umuman ko'rmasdi. Yarim soat jadvalda baribir BUTUN katak egallaydi
+    (odatda kun oxirgi darsi, hafta ma hafta almashib turadi), shuning uchun
+    yuqoriga yaxlitlanadi.
+    """
+    try:
+        h = float(a.get("hoursPerWeek") or 0)
+    except (TypeError, ValueError):
+        return 0
+    if h <= 0:
+        return 0
+    return int(math.ceil(h - 1e-9))
+
+
+def _is_half(a):
+    """Biriktirishda yarim soat bormi (2.5, 0.5 kabi)."""
+    try:
+        h = float(a.get("hoursPerWeek") or 0)
+    except (TypeError, ValueError):
+        return False
+    return abs(h - round(h)) > 0.01
+
+
+
+def _teacher_work_days(cid, subid, assignments, teachers, days, slots):
+    """Shu (sinf, fan) ni o'qitadigan o'qituvchi haftada necha kun ishlaydi.
+
+    Metodik kun va butunlay band deb belgilangan kunlar chiqarib tashlanadi.
+    Bo'linadigan darsda ikkala o'qituvchidan KAM ishlaydigani hisobga olinadi —
+    chunki dars ikkalasi ham bo'sh bo'lgandagina o'tadi.
+    """
+    ids = []
+    for a in assignments:
+        if a.get("classId") == cid and a.get("subjectId") == subid:
+            if a.get("teacherId"):
+                ids.append(a["teacherId"])
+            if a.get("isSplit") and a.get("splitTeacherId"):
+                ids.append(a["splitTeacherId"])
+    if not ids:
+        return days
+    best = days
+    for tid in ids:
+        t = teachers.get(tid)
+        if not t:
+            continue
+        n = 0
+        for d in range(days):
+            if t.get("methodicalDay") is not None and int(t["methodicalDay"]) == d:
+                continue
+            unav = t.get("unavailable") or {}
+            if all(unav.get("%d-%d" % (d, s)) for s in range(slots)):
+                continue                      # kun butunlay band
+            n += 1
+        best = min(best, n)
+    return best
 
 
 def _fixed_slot(subject):
@@ -1304,7 +1375,7 @@ def validate_schedule(entries, data):
     need, got = {}, {}
     for a in data.get("assignments", []):
         k = (a.get("classId"), a.get("subjectId"))
-        need[k] = need.get(k, 0) + int(a.get("hoursPerWeek") or 0)
+        need[k] = need.get(k, 0) + _hours_ceil(a)
     for e in entries:
         if e.get("group") == "B":
             continue
@@ -1368,7 +1439,7 @@ def _unfilled_reason(a, data):
     """
     school = data.get("school", {})
     days = _num(school.get("daysPerWeek"), 6)
-    need = int(a.get("hoursPerWeek") or 0)
+    need = _hours_ceil(a)
 
     teachers = {t["id"]: t for t in data.get("teachers", [])}
     classes = {c["id"]: c for c in data.get("classes", [])}
@@ -1388,7 +1459,7 @@ def _unfilled_reason(a, data):
     # 1) O'qituvchining haftalik limiti
     t_need = 0
     for x in data.get("assignments", []):
-        h = int(x.get("hoursPerWeek") or 0)
+        h = _hours_ceil(x)
         if x.get("teacherId") == t["id"]:
             t_need += h
         if x.get("isSplit") and x.get("splitTeacherId") == t["id"]:
@@ -1417,7 +1488,7 @@ def _unfilled_reason(a, data):
                 % (t.get("name", t["id"]), t_need, cap))
 
     # 3) Sinf sig'imi
-    c_need = sum(int(x.get("hoursPerWeek") or 0)
+    c_need = sum(_hours_ceil(x)
                  for x in data.get("assignments", [])
                  if x.get("classId") == c["id"])
     busy = sum(1 for v in (c.get("busyDays") or {}).values() if v)
@@ -1440,7 +1511,7 @@ def _unfilled_reason(a, data):
 
     # 5) Maxsus xona
     if a.get("roomId"):
-        r_need = sum(int(x.get("hoursPerWeek") or 0)
+        r_need = sum(_hours_ceil(x)
                      for x in data.get("assignments", [])
                      if x.get("roomId") == a["roomId"])
         two = int(school.get("shiftMode") or 1) == 2
