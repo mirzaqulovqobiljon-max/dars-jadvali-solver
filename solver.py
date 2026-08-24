@@ -938,7 +938,10 @@ def solve_timetable(data, max_seconds=20, relax_days=0, require_all=False):
                         if a.get("isSplit") and a.get("splitTeacherId"):
                             entries.append({
                                 "classId": a["classId"],
-                                "subjectId": a["subjectId"],
+                                # 2-guruh O'Z fanini oladi (har xil fanli
+                                # bo'linish uchun: 1-guruh Chet tili, 2-guruh
+                                # Informatika). Ko'rsatilmagan bo'lsa 1-guruh fani.
+                                "subjectId": a.get("splitSubjectId") or a["subjectId"],
                                 "teacherId": a["splitTeacherId"],
                                 "roomId": a.get("splitRoomId"),
                                 "day": d, "lesson": s,
