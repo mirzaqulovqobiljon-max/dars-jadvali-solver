@@ -159,6 +159,11 @@ def diagnose(data):
     return msgs
 
 
+def unav_key(shift, d, s):
+    """O'qituvchi bandligi kaliti — 2-smena alohida: "2:kun-soat" (frontend bilan mos)."""
+    return (f"2:{d}-{s}" if int(shift or 1) == 2 else f"{d}-{s}")
+
+
 def _greedy_seed(data, days, slots, teachers, subjects, assignments):
     """Tez greedy jadval: barcha qattiq shartlarga rioya qiladi, zich va muvozanatli.
     Natija: set of (ai, d, s) — CP-SAT uchun boshlang'ich yechim (hint)."""
@@ -168,14 +173,15 @@ def _greedy_seed(data, days, slots, teachers, subjects, assignments):
     csd = set()         # (cid, subid, d) — bir kunda bir fan
     t_hours = {}        # tid -> jami soat
     c_dayload = {}      # (cid, d) -> soat soni
+    _cs = {c["id"]: int(c.get("shift") or 1) for c in data["classes"]}
 
-    def teacher_ok(tid, d, s):
+    def teacher_ok(tid, d, s, shift=1):
         t = teachers.get(tid)
         if not t:
             return False
         if t.get("methodicalDay") is not None and int(t["methodicalDay"]) == d:
             return False
-        if t.get("unavailable", {}).get(f"{d}-{s}"):
+        if t.get("unavailable", {}).get(unav_key(shift, d, s)):
             return False
         return True
 
@@ -219,9 +225,10 @@ def _greedy_seed(data, days, slots, teachers, subjects, assignments):
             for s in range(slots):
                 if (cid, d, s) in c_busy:
                     continue
-                if (tid, d, s) in t_busy or not teacher_ok(tid, d, s):
+                _sh = _cs.get(cid, 1)
+                if (tid, d, s) in t_busy or not teacher_ok(tid, d, s, _sh):
                     continue
-                if stid and ((stid, d, s) in t_busy or not teacher_ok(stid, d, s)):
+                if stid and ((stid, d, s) in t_busy or not teacher_ok(stid, d, s, _sh)):
                     continue
                 if not subject_ok(subid, d, s):
                     continue
@@ -401,14 +408,15 @@ def solve_timetable(data, max_seconds=20, relax_days=0, require_all=False):
             if e.get("roomId"):
                 fixed_room_cell.add((e["roomId"], e["day"], cell))
 
-    def teacher_ok(tid, d, s):
-        """o'qituvchi (tid) d-kun s-soatda ishlay oladimi (metodik/bandlik)."""
+    def teacher_ok(tid, d, s, shift=1):
+        """o'qituvchi (tid) d-kun s-soatda ishlay oladimi (metodik/bandlik).
+        shift — sinf smenasi; 2-smena bandligi alohida kalitda saqlanadi."""
         t = teachers.get(tid)
         if not t:
             return False
         if t.get("methodicalDay") is not None and int(t["methodicalDay"]) == d:
             return False
-        if t.get("unavailable", {}).get(f"{d}-{s}"):
+        if t.get("unavailable", {}).get(unav_key(shift, d, s)):
             return False
         return True
 
@@ -427,12 +435,13 @@ def solve_timetable(data, max_seconds=20, relax_days=0, require_all=False):
                 # fan cheklovi
                 if not subject_ok(a["subjectId"], d, s):
                     ok = False
-                # asosiy o'qituvchi
-                if ok and not teacher_ok(a["teacherId"], d, s):
+                # asosiy o'qituvchi (sinf smenasi bo'yicha bandlik)
+                _ash = class_shift.get(a["classId"], 1)
+                if ok and not teacher_ok(a["teacherId"], d, s, _ash):
                     ok = False
                 # split ikkinchi o'qituvchi ham shu vaqtda ishlashi kerak
                 if ok and a.get("isSplit") and a.get("splitTeacherId"):
-                    if not teacher_ok(a["splitTeacherId"], d, s):
+                    if not teacher_ok(a["splitTeacherId"], d, s, _ash):
                         ok = False
                 # qulflangan darslar bilan to'qnashuv bo'lmasin (REAL VAQT bo'yicha)
                 if ok:
@@ -1640,13 +1649,13 @@ def _compact(entries, data, days, slots, teachers, subjects):
             if e.get("roomId"):
                 room_busy.add((e["roomId"], e["day"], cell))
 
-    def teacher_ok(tid, d, s):
+    def teacher_ok(tid, d, s, shift=1):
         t = teachers.get(tid)
         if not t:
             return True
         if t.get("methodicalDay") is not None and int(t["methodicalDay"]) == d:
             return False
-        if t.get("unavailable", {}).get(f"{d}-{s}"):
+        if t.get("unavailable", {}).get(unav_key(shift, d, s)):
             return False
         return True
 
@@ -1671,7 +1680,7 @@ def _compact(entries, data, days, slots, teachers, subjects):
                     return False
                 if e.get("roomId") and (e["roomId"], d, c2) in room_busy:
                     return False
-            if not teacher_ok(e["teacherId"], d, s):
+            if not teacher_ok(e["teacherId"], d, s, class_shift.get(e["classId"], 1)):
                 return False
             if not subject_ok(e["subjectId"], d, s):
                 return False
