@@ -375,9 +375,21 @@ def solve_timetable(data, max_seconds=20, relax_days=0, require_all=False):
     classes = data["classes"]
     assignments = data["assignments"]
     class_busy = {}   # cid -> set(busy day indexes)
+    class_slot_off = {}   # cid -> set of (day, slot) band soatlar
     for c in classes:
         bd = c.get("busyDays") or {}
         class_busy[c["id"]] = set(int(k) for k, v in bd.items() if v)
+        un = c.get("unavailable") or {}
+        so = set()
+        for k, v in un.items():
+            if not v:
+                continue
+            try:
+                dd, ss = str(k).split("-")
+                so.add((int(dd), int(ss)))
+            except Exception:
+                pass
+        class_slot_off[c["id"]] = so
 
     # ===== QULFLANGAN SINFLAR (fixedEntries) =====
     # Qulflangan sinf darslari o'z joyida qat'iy qoladi. Ular optimizatsiyaga
@@ -456,6 +468,9 @@ def solve_timetable(data, max_seconds=20, relax_days=0, require_all=False):
                             ok = False
                 # sinfning band kuni — dars qo'yilmaydi
                 if ok and d in class_busy.get(a["classId"], set()):
+                    ok = False
+                # sinfning band SOATi (aniq kun-soat) — dars qo'yilmaydi
+                if ok and (d, s) in class_slot_off.get(a["classId"], set()):
                     ok = False
                 # SMENA: bu sinfda bunday soat umuman yo'q (masalan 2-smenada 5 soat)
                 if ok and s >= cls_slots(a["classId"]):
